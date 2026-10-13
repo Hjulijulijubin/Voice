@@ -1,57 +1,56 @@
-import { h, uid, prefs, formatTime, formatBytes, debounce } from './util.js';
+import { h, prefs, formatTime, formatBytes, colorFor, initials, debounce } from './util.js';
 import { icon } from './icons.js';
-import { toast, avatar, modal, promptModal, confirmModal, popover, closePopover } from './ui.js';
-import { SignalingClient } from './signaling-client.js';
-import { Mesh, DEFAULT_ICE_SERVERS } from './mesh.js';
+import { toast, modal, promptModal, confirmModal, popover, closePopover } from './ui.js';
 import { AudioEngine, Sfx } from './audio.js';
-import { FileManager } from './files.js';
+import { MediaEngine } from './media.js';
+import { Room, newRoomRecord } from './room.js';
 import { store } from './store.js';
+import { createInvite, parseInvite } from './crypto.js';
 import { renderText, mentionsMe } from './richtext.js';
 import { loadSettings, saveSettings, openSettings, parseIceServers, describeBinding } from './settings.js';
 
 const $ = (id) => document.getElementById(id);
-const AUTO_DOWNLOAD_LIMIT = 25 * 1024 * 1024; // images/audio/video below this are fetched automatically
 const MAX_MESSAGE = 4000;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 const settings = loadSettings();
-const userId = prefs.get('userId', null) || uid();
-prefs.set('userId', userId);
-
 const state = {
   name: prefs.get('name', ''),
-  connected: false,
-  address: null,
-  password: '',
-  serverKey: null,
-  serverName: '',
-  selfId: null,
-  channels: [],
-  /** peerId -> {id, userId, name, voice, muted, deafened} */
-  peers: new Map(),
-  textChannel: 'general',
-  voice: null,
   muted: prefs.get('muted', false),
   deafened: prefs.get('deafened', false),
-  unread: new Map(),
-  hosting: false,
-  typing: new Map(), // userId -> {name, channel, until}
   membersVisible: prefs.get('membersVisible', true),
-  reconnecting: false,
-  appInfo: { globalPtt: false, platform: 'linux', args: [] },
+  textChannel: prefs.get('textChannels', {}), // roomId -> channel id
+  appInfo: { globalPtt: false, platform: 'linux', args: [], hardwareAcceleration: true },
+  globalPttActive: false,
+  rvStatus: { relays: [], lan: false },
 };
-
-const signaling = new SignalingClient();
-const audio = new AudioEngine(settings);
-const sfx = new Sfx();
-let mesh = null;
-let files = null;
+/** @type {Map<string, Room>} */
+const rooms = new Map();
+let current = null; // room on screen
+let voiceRoom = null; // room whose voice channel we're in
+let voiceChannel = null;
 let lastTyping = 0;
 
+const audio = new AudioEngine(settings);
+const media = new MediaEngine(audio, settings);
+const sfx = new Sfx();
+
+const roomCtx = {
+  settings,
+  getName: () => state.name,
+  extraIce: () => parseIceServers(settings.iceServers),
+  onAudioPacket: (room, payload) => {
+    if (room === voiceRoom && !state.deafened) media.onPacket(payload);
+  },
+  onCustomRoutes: (room, n) => {
+    if (room === voiceRoom) media.setSending(n > 0);
+  },
+};
+
 // ---------------------------------------------------------------------------
-// Context handed to the settings dialog
+// Settings dialog context
 // ---------------------------------------------------------------------------
 const appCtx = {
   settings,
@@ -65,6 +64,9 @@ const appCtx = {
   get platform() {
     return state.appInfo.platform;
   },
+  get hardwareAcceleration() {
+    return state.appInfo.hardwareAcceleration;
+  },
   requestMediaAccess: () => window.voice.requestMediaAccess(),
   async ensureMic() {
     if (audio.running) return;
@@ -72,7 +74,7 @@ const appCtx = {
     await audio.start();
   },
   releaseMicIfIdle() {
-    if (!state.voice && audio.running && !audio.loopbackActive) audio.stop();
+    if (!voiceRoom && audio.running && !audio.loopbackActive) audio.stop();
   },
   async restartMic() {
     try {
@@ -82,14 +84,25 @@ const appCtx = {
     }
   },
   applyOutput() {
-    mesh?.setOutputDevice(settings.outputDeviceId);
+    for (const r of rooms.values()) r.overlay.setOutputDevice(settings.outputDeviceId);
+    media.setOutputDevice(settings.outputDeviceId);
     sfx.setSink(settings.outputDeviceId);
   },
   applyQuality() {
-    mesh?.applyQuality();
+    for (const r of rooms.values()) r.overlay.applyQuality();
+    media.applySettings();
   },
   applyJitterTarget() {
-    mesh?.applyJitterTarget();
+    for (const r of rooms.values()) r.overlay.applyJitterTarget();
+    media.applySettings();
+  },
+  applyMode() {
+    media.applySettings();
+    for (const r of rooms.values()) r.overlay._recomputeRoutes();
+  },
+  applyNetwork() {
+    window.voice.rendezvous.configure({ relays: settings.relays, lan: settings.lan });
+    for (const r of rooms.values()) r.overlay.setRelayAllowed(settings.allowRelay);
   },
   bindPtt,
   renderSelf,
@@ -99,355 +112,298 @@ const appCtx = {
   setName(name) {
     state.name = name.slice(0, 32);
     prefs.set('name', state.name);
-    sendState();
+    for (const r of rooms.values()) r.setName(state.name);
     renderSelf();
-    toast('Name updated');
+    renderMembers();
   },
 };
 
 // ---------------------------------------------------------------------------
-// Connect screen
+// Rooms
 // ---------------------------------------------------------------------------
-function recentServers() {
-  return prefs.get('recent', []);
+async function startRoom(record) {
+  const room = new Room(record, roomCtx);
+  rooms.set(record.roomId, room);
+  room.on('messages', (msgs, live) => onMessages(room, msgs, live));
+  room.on('state', () => {
+    if (room === current) {
+      renderChannels();
+      renderHeader();
+      if (!room.channels.some((c) => c.id === state.textChannel[room.id])) openTextChannel(currentChannel());
+    }
+    if (room === voiceRoom && !room.channels.some((c) => c.id === voiceChannel)) leaveVoice();
+    renderRail();
+  });
+  room.on('roster', () => onRoster(room));
+  room.on('speaking', () => room === current && renderSpeaking());
+  room.on('typing', () => room === current && renderTyping());
+  room.on('holders', (fileId) => room === current && updateFileCards(fileId));
+  room.on('progress', (fileId, frac) => room === current && updateFileProgress(fileId, frac));
+  room.on('uploads', (n) => {
+    if (room !== current) return;
+    $('upload-indicator').classList.toggle('hidden', n === 0);
+    $('upload-indicator').textContent = n ? `Sending files to ${n} member${n > 1 ? 's' : ''}…` : '';
+  });
+  await room.start();
+  room.overlay.setOutputDevice(settings.outputDeviceId);
+  for (const [id, v] of Object.entries(prefs.get('volumes', {}))) room.overlay.setUserVolume(id, v);
+  for (const id of prefs.get('localMutes', [])) room.overlay.setUserLocalMute(id, true);
+  return room;
 }
 
-function rememberServer(address) {
-  const list = recentServers().filter((a) => a !== address);
-  list.unshift(address);
-  prefs.set('recent', list.slice(0, 6));
+async function createRoom(name) {
+  const { secret, code } = createInvite();
+  const record = await newRoomRecord(secret, name);
+  await store.putRoom(record);
+  const room = await startRoom(record);
+  await room.applyOp({ kind: 'name', value: name });
+  await room.applyOp({ kind: 'channel-add', cid: 'random', name: 'random', type: 'text' });
+  await room.applyOp({ kind: 'channel-add', cid: 'gaming', name: 'Gaming', type: 'voice' });
+  await room.applyOp({ kind: 'channel-add', cid: 'hifi', name: 'Music (Hi-Fi)', type: 'voice' });
+  selectRoom(room);
+  return { room, code };
 }
 
-function renderConnect() {
-  $('cv-name').value = state.name;
-  const last = recentServers()[0];
-  if (last && !$('cv-address').value) $('cv-address').value = last;
-  $('hv-name').value = prefs.get('hostName', '') || (state.name ? `${state.name}'s server` : '');
-  $('hv-port').value = prefs.get('hostPort', 9987);
-  const recent = $('recent-servers');
-  recent.replaceChildren(
-    ...recentServers().map((a) =>
-      h(
-        'button',
-        {
-          type: 'button',
-          title: 'Use this address',
-          onclick: () => {
-            $('cv-address').value = a;
-          },
-        },
-        a,
-      ),
-    ),
-  );
+async function joinRoom(code) {
+  const secret = parseInvite(code);
+  const record = await newRoomRecord(secret, '');
+  if (rooms.has(record.roomId)) {
+    selectRoom(rooms.get(record.roomId));
+    return rooms.get(record.roomId);
+  }
+  await store.putRoom(record);
+  const room = await startRoom(record);
+  selectRoom(room);
+  sfx.play('connect');
+  return room;
+}
+
+async function leaveRoom(room) {
+  if (room === voiceRoom) leaveVoice();
+  // Our copies are deleted: un-announce them so "deleted by everyone" still works.
+  await room.files.releaseAll().catch(() => {});
+  room.stop();
+  rooms.delete(room.id);
+  await store.deleteRoom(room.id);
+  await window.voice.files.removeRoom(room.id);
+  if (current === room) {
+    current = null;
+    const next = rooms.values().next().value;
+    if (next) selectRoom(next);
+    else showWelcome();
+  }
+  renderRail();
+}
+
+function selectRoom(room) {
+  current = room;
+  prefs.set('lastRoom', room.id);
+  showMain();
+  renderAll();
+  openTextChannel(currentChannel());
+}
+
+function currentChannel() {
+  if (!current) return null;
+  const saved = state.textChannel[current.id];
+  return current.channels.some((c) => c.id === saved && c.type === 'text') ? saved : current.channels.find((c) => c.type === 'text')?.id;
+}
+
+let voiceMembersBefore = new Set();
+function onRoster(room) {
+  if (room === voiceRoom) {
+    const now = new Set(room.overlay.roster().filter((m) => m.info.voice === voiceChannel).map((m) => m.id));
+    if ([...now].some((id) => !voiceMembersBefore.has(id))) sfx.play('join');
+    else if ([...voiceMembersBefore].some((id) => !now.has(id))) sfx.play('leave');
+    voiceMembersBefore = now;
+  }
+  if (room === current) {
+    renderMembers();
+    renderChannels();
+    renderHeader();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Welcome screen
+// ---------------------------------------------------------------------------
+function showWelcome(closable = false) {
+  $('main-view').classList.add('hidden');
+  $('welcome-view').classList.remove('hidden');
+  $('welcome-close').classList.toggle('hidden', !closable);
+  $('wv-name').value = state.name;
+  $('welcome-error').textContent = '';
+  ($('wv-name').value ? $('cv-room') : $('wv-name')).focus();
+}
+
+function showMain() {
+  $('welcome-view').classList.add('hidden');
+  $('main-view').classList.remove('hidden');
+  $('main-view').classList.toggle('no-members', !state.membersVisible);
 }
 
 function readName() {
-  const name = $('cv-name').value.trim();
+  const name = $('wv-name').value.trim();
   if (!name) {
-    $('connect-error').textContent = 'Please choose a display name first.';
-    $('cv-name').focus();
-    return null;
+    $('welcome-error').textContent = 'Please choose a display name first.';
+    $('wv-name').focus();
+    return false;
   }
-  state.name = name.slice(0, 32);
-  prefs.set('name', state.name);
-  return state.name;
+  if (name !== state.name) appCtx.setName(name);
+  return true;
 }
+
+$('welcome-close').append(icon('x'));
+$('welcome-close').onclick = () => current && showMain();
+
+$('create-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!readName()) return;
+  try {
+    const { code } = await createRoom($('cv-room').value.trim() || `${state.name}'s room`);
+    $('cv-room').value = '';
+    showInvite(code, true);
+  } catch (err) {
+    $('welcome-error').textContent = err.message;
+  }
+});
 
 $('join-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!readName()) return;
-  const address = $('cv-address').value.trim();
-  if (!address) return;
-  await connect(address, $('cv-password').value);
-});
-
-$('host-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  if (!readName()) return;
-  const port = Number($('hv-port').value) || 9987;
-  const name = $('hv-name').value.trim() || `${state.name}'s server`;
-  const password = $('hv-password').value;
-  prefs.set('hostName', name);
-  prefs.set('hostPort', port);
-  $('connect-error').textContent = '';
   try {
-    const status = await window.voice.startServer({ port, name, password });
-    state.hosting = true;
-    await connect(`127.0.0.1:${status.port}`, password, { remember: false });
+    await joinRoom($('jv-code').value);
+    $('jv-code').value = '';
   } catch (err) {
-    $('connect-error').textContent = `Could not start server: ${err.message}`;
+    $('welcome-error').textContent = err.message;
   }
 });
 
-// ---------------------------------------------------------------------------
-// Connection lifecycle
-// ---------------------------------------------------------------------------
-async function connect(address, password, { remember = true, silent = false } = {}) {
-  $('connect-error').textContent = '';
-  const submitButtons = document.querySelectorAll('#connect-view button[type=submit]');
-  submitButtons.forEach((b) => (b.disabled = true));
-  try {
-    const welcome = await signaling.connect(address, { name: state.name, userId, password });
-    state.address = address;
-    state.password = password;
-    state.serverKey = signaling.url;
-    state.serverName = welcome.serverName;
-    state.selfId = welcome.id;
-    state.channels = welcome.channels;
-    state.peers = new Map(welcome.peers.map((p) => [p.id, p]));
-    state.connected = true;
-    if (remember) rememberServer(address);
-    if (!state.channels.some((c) => c.id === state.textChannel && c.type === 'text')) {
-      state.textChannel = state.channels.find((c) => c.type === 'text')?.id;
-    }
-
-    setupMesh(welcome.iceServers || []);
-    for (const peer of welcome.peers) mesh.connectTo(peer);
-
-    showMain();
-    if (!silent) sfx.play('connect');
-    // Rejoin the voice channel after a reconnect.
-    if (state.voice && state.channels.some((c) => c.id === state.voice)) {
-      mesh.setLocalTrack(audio.track);
-      mesh.setVoiceChannel(state.voice);
-    } else {
-      state.voice = null;
-    }
-    sendState();
-    renderAll();
-    await openTextChannel(state.textChannel);
-  } catch (err) {
-    if (!silent) $('connect-error').textContent = err.message;
-    throw err;
-  } finally {
-    submitButtons.forEach((b) => (b.disabled = false));
-  }
-}
-
-function setupMesh(serverIce) {
-  mesh?.destroy();
-  const iceServers = [...DEFAULT_ICE_SERVERS, ...parseIceServers(settings.iceServers), ...serverIce];
-  mesh = new Mesh({
-    signaling,
-    selfId: state.selfId,
-    iceServers,
-    getQuality: () => settings.quality,
-    getJitterTargetMs: () => settings.jitterTargetMs,
-  });
-  mesh.setOutputDevice(settings.outputDeviceId);
-  mesh.setDeafened(state.deafened);
-  for (const [uidKey, vol] of Object.entries(prefs.get('volumes', {}))) mesh.volumes.set(uidKey, vol);
-  for (const u of prefs.get('localMutes', [])) mesh.localMutes.add(u);
-  files = new FileManager(mesh);
-
-  mesh.on('peer-open', async (peer) => {
-    // Ask for any chat history we don't have yet.
-    const since = await store.latestTimestamp(state.serverKey).catch(() => 0);
-    peer.sendJson({ t: 'sync-req', since });
-    renderMembers();
-  });
-  mesh.on('peer-state', () => {
-    renderMembers();
-    renderChannels();
-  });
-  mesh.on('speaking', () => renderSpeaking());
-  mesh.on('data', (peer, msg) => onPeerData(peer, msg));
-  files.on('progress', (fileId, frac) => updateFileProgress(fileId, frac));
-  files.on('uploads', (n) => {
-    const el = $('upload-indicator');
-    el.classList.toggle('hidden', n === 0);
-    el.textContent = n ? `Uploading to ${n} peer${n > 1 ? 's' : ''}…` : '';
-  });
-}
-
-signaling.on('peer-joined', ({ peer }) => {
-  state.peers.set(peer.id, peer);
-  mesh?.expect(peer);
-  mesh?.updateInfo(peer);
-  renderMembers();
-  renderChannels();
-});
-
-signaling.on('peer-left', ({ id }) => {
-  const peer = state.peers.get(id);
-  state.peers.delete(id);
-  mesh?.remove(id);
-  files?.peerGone(id);
-  if (peer && state.voice && peer.voice === state.voice) sfx.play('leave');
-  renderMembers();
-  renderChannels();
-  renderTyping();
-});
-
-signaling.on('peer-state', ({ peer }) => {
-  if (peer.id === state.selfId) return;
-  const before = state.peers.get(peer.id);
-  state.peers.set(peer.id, peer);
-  mesh?.updateInfo(peer);
-  if (state.voice) {
-    if (peer.voice === state.voice && before?.voice !== state.voice) sfx.play('join');
-    if (before?.voice === state.voice && peer.voice !== state.voice) sfx.play('leave');
-  }
-  renderMembers();
-  renderChannels();
-});
-
-signaling.on('signal', ({ from, data }) => mesh?.onSignal(from, data));
-
-signaling.on('channels', ({ channels }) => {
-  state.channels = channels;
-  if (!channels.some((c) => c.id === state.textChannel)) openTextChannel(channels.find((c) => c.type === 'text')?.id);
-  if (state.voice && !channels.some((c) => c.id === state.voice)) leaveVoice();
-  renderChannels();
-});
-
-signaling.on('disconnected', (ev) => {
-  if (!state.connected) return;
-  if (ev.code === 4003) {
-    // Same identity connected from somewhere else.
-    toast('You connected from another window — this session was closed.', 'error', 8000);
-    leaveServer();
+window.voice.onInvite(async (code) => {
+  if (!state.name) {
+    showWelcome(!!current);
+    $('jv-code').value = code;
     return;
   }
-  mesh?.destroy();
-  mesh = null;
-  state.peers.clear();
-  renderAll();
-  $('reconnect-banner').classList.remove('hidden');
-  scheduleReconnect(1000);
+  try {
+    await joinRoom(code);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
 });
 
-function scheduleReconnect(delay) {
-  if (state.reconnecting) return;
-  state.reconnecting = true;
-  setTimeout(async () => {
-    state.reconnecting = false;
-    if (!state.connected) return;
-    try {
-      await connect(state.address, state.password, { remember: false, silent: true });
-      $('reconnect-banner').classList.add('hidden');
-      toast('Reconnected');
-    } catch {
-      scheduleReconnect(Math.min(delay * 2, 15000));
-    }
-  }, delay);
+function showInvite(code, fresh = false) {
+  const body = h(
+    'div',
+    {},
+    h('p', {}, fresh ? 'Your room is ready. Send this invite code to your friends through any other chat:' : 'Anyone with this code can join the room:'),
+    h('div', { class: 'copy-row' }, h('span', { class: 'invite-code' }, code), h('button', { class: 'icon-btn', title: 'Copy', onclick: () => copy(code) }, icon('copy', 16))),
+    h(
+      'p',
+      { class: 'hint muted small' },
+      'The code is the room key: it lets people in and decrypts everything. Only share it with people you trust. There is no server and no account — the room lives on the devices of its members.',
+    ),
+  );
+  modal({ title: 'Invite people', small: true, body, footer: [h('button', { class: 'btn primary', onclick: () => copy(code) }, 'Copy invite code')] });
 }
 
-async function leaveServer() {
-  state.connected = false;
-  leaveVoice({ silent: true });
-  signaling.close();
-  mesh?.destroy();
-  mesh = null;
-  files = null;
-  state.peers.clear();
-  if (state.hosting) {
-    await window.voice.stopServer();
-    state.hosting = false;
-  }
-  $('reconnect-banner').classList.add('hidden');
-  $('main-view').classList.add('hidden');
-  $('connect-view').classList.remove('hidden');
-  renderConnect();
-}
-
-function sendState() {
-  signaling.send({ type: 'state', voice: state.voice, muted: state.muted, deafened: state.deafened, name: state.name });
+function copy(text) {
+  navigator.clipboard.writeText(text);
+  toast('Copied to clipboard');
 }
 
 // ---------------------------------------------------------------------------
 // Voice
 // ---------------------------------------------------------------------------
 async function joinVoice(channelId) {
-  if (state.voice === channelId) return;
+  if (!current || (voiceRoom === current && voiceChannel === channelId)) return;
   try {
     await appCtx.ensureMic();
   } catch (err) {
     toast(`Cannot access microphone: ${err.message}`, 'error', 7000);
     return;
   }
-  state.voice = channelId;
+  if (voiceRoom && voiceRoom !== current) leaveVoice({ silent: true, keepMic: true });
+  voiceRoom = current;
+  voiceChannel = channelId;
+  const ov = voiceRoom.overlay;
+  media.setRoom(ov, voiceRoom.keys.mediaKeyRaw, voiceRoom.selfId);
+  media.setDeafened(state.deafened);
   audio.setMuted(state.muted);
   audio.setDeafened(state.deafened);
-  mesh?.setLocalTrack(audio.track);
-  mesh?.setVoiceChannel(channelId);
-  sendState();
+  ov.setDeafened(state.deafened);
+  ov.setLocalTrack(audio.track);
+  ov.setInfo({ muted: state.muted, deafened: state.deafened });
+  ov.setVoiceChannel(channelId);
+  voiceMembersBefore = new Set(ov.roster().filter((m) => m.info.voice === channelId).map((m) => m.id));
   sfx.play('join');
   renderVoiceState();
 }
 
-function leaveVoice({ silent = false } = {}) {
-  if (!state.voice) return;
-  state.voice = null;
-  mesh?.setVoiceChannel(null);
-  mesh?.setLocalTrack(null);
-  if (!audio.loopbackActive) audio.stop();
-  sendState();
+function leaveVoice({ silent = false, keepMic = false } = {}) {
+  if (!voiceRoom) return;
+  const ov = voiceRoom.overlay;
+  ov.setVoiceChannel(null);
+  ov.setLocalTrack(null);
+  media.setSending(false);
+  media.shutdown();
+  voiceRoom = null;
+  voiceChannel = null;
+  if (!keepMic && !audio.loopbackActive) audio.stop();
   if (!silent) sfx.play('leave');
   renderVoiceState();
 }
 
 function setMuted(muted) {
+  if (!muted && state.deafened) return setDeafened(false);
   state.muted = muted;
-  if (!muted && state.deafened) setDeafened(false, true);
   prefs.set('muted', muted);
   audio.setMuted(muted);
+  voiceRoom?.overlay.setInfo({ muted });
   sfx.play(muted ? 'mute' : 'unmute');
-  sendState();
   renderVoiceState();
 }
 
-function setDeafened(deafened, quiet = false) {
+function setDeafened(deafened) {
   state.deafened = deafened;
   prefs.set('deafened', deafened);
   audio.setDeafened(deafened);
-  mesh?.setDeafened(deafened);
-  if (!quiet) sfx.play(deafened ? 'mute' : 'unmute');
-  sendState();
+  media.setDeafened(deafened);
+  voiceRoom?.overlay.setDeafened(deafened);
+  voiceRoom?.overlay.setInfo({ deafened });
+  sfx.play(deafened ? 'mute' : 'unmute');
   renderVoiceState();
 }
 
 async function bindPtt() {
-  const global = settings.inputMode === 'ptt' ? await window.voice.bindPtt(settings.pttBinding) : await window.voice.bindPtt(null);
-  state.globalPttActive = global;
+  state.globalPttActive = await window.voice.bindPtt(settings.inputMode === 'ptt' ? settings.pttBinding : null);
   renderSelf();
 }
 
 function matchesBinding(e) {
   const b = settings.pttBinding;
   if (!b || settings.inputMode !== 'ptt') return false;
-  if (b.type === 'key') return e.code === b.code;
-  return e.button === b.button;
+  return b.type === 'key' ? e.code === b.code : e.button === b.button;
 }
 
 window.addEventListener('keydown', (e) => {
-  // Shortcuts
   if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyM') {
     e.preventDefault();
-    if (state.connected) setMuted(!state.muted);
-    return;
+    return setMuted(!state.muted);
   }
   if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyD') {
     e.preventDefault();
-    if (state.connected) setDeafened(!state.deafened);
-    return;
+    return setDeafened(!state.deafened);
   }
   if (e.repeat || !matchesBinding(e)) return;
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName);
-  // Plain letter keys still type normally in text fields.
   if (typing && /^(Key|Digit|Space)/.test(e.code) && !state.globalPttActive) return;
   audio.setPtt(true);
 });
-window.addEventListener('keyup', (e) => {
-  if (matchesBinding(e)) audio.setPtt(false);
-});
+window.addEventListener('keyup', (e) => matchesBinding(e) && audio.setPtt(false));
 window.addEventListener('mousedown', (e) => e.button > 0 && matchesBinding(e) && audio.setPtt(true));
 window.addEventListener('mouseup', (e) => e.button > 0 && matchesBinding(e) && audio.setPtt(false));
-window.addEventListener('blur', () => {
-  // Without a global hook we would never see the key-up while unfocused.
-  if (!state.globalPttActive) audio.setPtt(false);
-});
+window.addEventListener('blur', () => !state.globalPttActive && audio.setPtt(false));
 window.voice.onPtt((down) => audio.setPtt(down));
 
 audio.on('transmitting', () => renderSpeaking());
@@ -457,196 +413,141 @@ audio.on('device-lost', () => {
   saveSettings(settings);
   appCtx.restartMic();
 });
-audio.on('track', (track) => mesh?.setLocalTrack(state.voice ? track : null));
+audio.on('track', (track) => {
+  voiceRoom?.overlay.setLocalTrack(track);
+  if (track) media.onMicRestart();
+});
 
-// Voice panel stats (ping, bitrate)
-setInterval(async () => {
-  if (!state.voice || !mesh) return;
-  const peers = [...mesh.peers.values()].filter((p) => p.together);
-  if (!peers.length) {
-    $('vp-stats').textContent = 'Alone in channel';
-    $('vp-status').classList.remove('warn');
+// Voice panel summary; only computed while in voice and visible.
+setInterval(() => {
+  if (!voiceRoom || document.hidden) return;
+  const ov = voiceRoom.overlay;
+  const listeners = ov.roster().filter((m) => m.info.voice === voiceChannel);
+  if (!listeners.length) {
     $('vp-status').textContent = 'Voice Connected';
+    $('vp-status').classList.remove('warn');
+    $('vp-stats').textContent = 'Alone in channel';
     return;
   }
-  const stats = await Promise.all(peers.map((p) => p.getStats().catch(() => null)));
-  const valid = stats.filter(Boolean);
-  const rtts = valid.map((s) => s.rttMs).filter((v) => v != null);
-  const out = valid.map((s) => s.outKbps).filter((v) => v != null);
-  const loss = valid.map((s) => s.lossPct).filter((v) => v != null);
-  const avgRtt = rtts.length ? rtts.reduce((a, b) => a + b, 0) / rtts.length : null;
-  const maxLoss = loss.length ? Math.max(...loss) : 0;
-  const allConnected = peers.every((p) => p.state === 'connected');
-  $('vp-status').textContent = allConnected ? 'Voice Connected' : 'Connecting…';
-  $('vp-status').classList.toggle('warn', !allConnected || maxLoss > 2);
-  const parts = [];
-  if (avgRtt != null) parts.push(`${Math.round(avgRtt)} ms`);
-  if (out.length) parts.push(`↑ ${Math.round(Math.max(...out))} kbps`);
-  if (maxLoss > 0.5) parts.push(`${maxLoss.toFixed(1)}% loss`);
+  const routes = listeners.map((m) => ov.audioRoutes.get(m.id) || { mode: 'none' });
+  const reachable = routes.filter((r) => r.mode !== 'none');
+  const relayed = reachable.filter((r) => r.mode === 'relay' && r.path.length > 1).length;
+  const worst = reachable.length ? Math.max(...reachable.map((r) => r.cost ?? 0)) : 0;
+  const unreachable = routes.length - reachable.length;
+  $('vp-status').classList.toggle('warn', unreachable > 0);
+  $('vp-status').textContent = unreachable ? `${unreachable} connecting…` : 'Voice Connected';
+  const parts = [`≤ ${Math.round(worst)} ms network`];
+  if (relayed) parts.push(`${relayed} via relay`);
+  if (settings.audioMode === 'ultra') parts.push(`ultra ${settings.ultraFrameMs} ms`);
   $('vp-stats').textContent = parts.join(' · ');
-}, 1000);
+}, 2000);
 
 // ---------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------
-function validMessage(m) {
-  return (
-    m &&
-    typeof m.id === 'string' &&
-    m.id.length <= 64 &&
-    typeof m.channel === 'string' &&
-    typeof m.ts === 'number' &&
-    typeof m.text === 'string' &&
-    m.text.length <= MAX_MESSAGE &&
-    m.author &&
-    typeof m.author.userId === 'string' &&
-    typeof m.author.name === 'string' &&
-    (!m.file || (typeof m.file.id === 'string' && typeof m.file.name === 'string' && typeof m.file.size === 'number'))
-  );
-}
-
-function sanitize(m) {
-  const out = { id: m.id, channel: m.channel, ts: m.ts, text: m.text, author: { userId: m.author.userId, name: String(m.author.name).slice(0, 32) } };
-  if (m.file) out.file = { id: m.file.id, name: String(m.file.name).slice(0, 255), size: m.file.size, type: String(m.file.type || '').slice(0, 100) };
-  return out;
-}
-
-async function onPeerData(peer, msg) {
-  if (!msg || typeof msg.t !== 'string') return;
-  switch (msg.t) {
-    case 'msg': {
-      if (!validMessage(msg.msg)) return;
-      const m = sanitize(msg.msg);
-      // Live messages must come from their author.
-      if (m.author.userId !== peer.info.userId) return;
-      await receiveMessage(m, true);
-      break;
-    }
-    case 'sync-req': {
-      const since = typeof msg.since === 'number' ? msg.since : 0;
-      const msgs = await store.getMessagesSince(state.serverKey, since).catch(() => []);
-      for (let i = 0; i < msgs.length; i += 50) {
-        peer.sendJson({ t: 'sync', msgs: msgs.slice(i, i + 50).map(sanitize) });
-      }
-      break;
-    }
-    case 'sync': {
-      if (!Array.isArray(msg.msgs)) return;
-      let touchedCurrent = false;
-      for (const raw of msg.msgs) {
-        if (!validMessage(raw)) continue;
-        const m = sanitize(raw);
-        const isNew = await store.addMessage(state.serverKey, m).catch(() => false);
-        if (isNew && m.channel === state.textChannel) touchedCurrent = true;
-      }
-      if (touchedCurrent) await openTextChannel(state.textChannel, true);
-      break;
-    }
-    case 'typing': {
-      if (typeof msg.channel !== 'string') return;
-      state.typing.set(peer.info.userId, { name: peer.info.name, channel: msg.channel, until: Date.now() + 4000 });
-      renderTyping();
-      break;
-    }
-    default:
-      if (msg.t.startsWith('file-')) files?.onControl(peer, msg);
+async function onMessages(room, msgs, live) {
+  if (room === current) {
+    const ch = currentChannel();
+    const here = msgs.filter((m) => m.channel === ch).sort((a, b) => a.ts - b.ts);
+    // History arriving from a sync may belong anywhere in the timeline.
+    if (!live && here.length > 1) await openTextChannel(ch, true);
+    else here.forEach((m) => appendMessage(m));
+    renderTyping();
   }
-}
-
-async function receiveMessage(m, live) {
-  const isNew = await store.addMessage(state.serverKey, m).catch(() => false);
-  if (!isNew) return;
-  state.typing.delete(m.author.userId);
-  renderTyping();
-  const mine = m.author.userId === userId;
-  if (m.channel === state.textChannel) {
-    appendMessage(m);
-  } else if (!mine) {
-    state.unread.set(m.channel, (state.unread.get(m.channel) || 0) + 1);
-    renderChannels();
-  }
-  if (live && !mine) {
+  for (const m of msgs) {
+    const mine = m.author.id === room.selfId;
+    if (!mine && !(room === current && m.channel === currentChannel())) room.unread.set(m.channel, (room.unread.get(m.channel) || 0) + 1);
+    if (!live || mine) continue;
     const mentioned = mentionsMe(m.text, state.name);
     if (mentioned || !document.hasFocus()) {
       if (settings.sounds) sfx.play('message');
       window.voice.attention();
     }
     if (mentioned && settings.notifications && !document.hasFocus()) {
-      const ch = state.channels.find((c) => c.id === m.channel);
-      new Notification(`${m.author.name} in #${ch?.name || m.channel}`, { body: m.text.slice(0, 200), silent: true });
+      new Notification(`${m.author.name} in ${room.name}`, { body: m.text.slice(0, 200), silent: true });
     }
   }
-}
-
-async function sendMessage(text, file = null) {
-  if (!state.connected || !state.textChannel) return;
-  const m = { id: uid(), channel: state.textChannel, ts: Date.now(), text, author: { userId, name: state.name } };
-  if (file) m.file = file;
-  mesh?.broadcast({ t: 'msg', msg: m });
-  await receiveMessage(m, false);
-}
-
-async function shareFiles(fileList) {
-  if (!files) return;
-  for (const file of fileList) {
-    if (file.size > 4 * 1024 * 1024 * 1024) {
-      toast(`${file.name} is larger than 4 GB`, 'error');
-      continue;
-    }
-    const meta = await files.share(file);
-    await sendMessage('', meta);
-  }
+  renderRail();
+  if (room === current) renderChannels();
 }
 
 async function openTextChannel(channelId, keepScroll = false) {
-  if (!channelId) return;
-  state.textChannel = channelId;
-  state.unread.delete(channelId);
-  const ch = state.channels.find((c) => c.id === channelId);
+  if (!current || !channelId) return;
+  const room = current;
+  state.textChannel[room.id] = channelId;
+  prefs.set('textChannels', state.textChannel);
+  room.unread.delete(channelId);
+  const ch = room.channels.find((c) => c.id === channelId);
   $('chat-title').replaceChildren(icon('hash', 20), ch?.name || channelId);
-  $('chat-sub').textContent = 'End-to-end peer-to-peer · history is synced between members';
+  $('chat-sub').textContent = 'End-to-end encrypted · stored only on members’ devices';
   $('composer-input').placeholder = `Message #${ch?.name || channelId}`;
   renderChannels();
+  renderRail();
   renderTyping();
-
   const list = $('messages');
   const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
-  const msgs = await store.getMessages(state.serverKey, channelId).catch(() => []);
-  if (state.textChannel !== channelId) return;
+  const fromBottom = list.scrollHeight - list.scrollTop;
+  if (histState.channel !== `${room.id}/${channelId}`) histState.limit = HISTORY_PAGE;
+  histState.channel = `${room.id}/${channelId}`;
+  const msgs = await store.getMessages(room.id, channelId, histState.limit);
+  histState.complete = msgs.length < histState.limit;
+  if (current !== room || currentChannel() !== channelId) return;
+  fileCards.clear();
   list.replaceChildren(
-    h('div', { class: 'empty-channel' }, h('h3', {}, `Welcome to #${ch?.name || channelId}!`), h('div', {}, 'This is the start of the channel. Messages are stored on the devices of the people here.')),
+    h(
+      'div',
+      { class: 'empty-channel' },
+      h('h3', {}, `Welcome to #${ch?.name || channelId}!`),
+      h('div', {}, 'Messages are signed by their authors, end-to-end encrypted and stored only on the devices of the people in this room.'),
+    ),
   );
   lastGroup = null;
   for (const m of msgs) appendMessage(m, false);
-  if (!keepScroll || atBottom) list.scrollTop = list.scrollHeight;
+  if (keepScroll === 'older') list.scrollTop = list.scrollHeight - fromBottom;
+  else if (!keepScroll || atBottom) list.scrollTop = list.scrollHeight;
 }
 
-let lastGroup = null; // {authorId, ts, el}
+// Load older messages when scrolling to the top (pages of 150).
+const HISTORY_PAGE = 150;
+const histState = { channel: null, limit: HISTORY_PAGE, complete: true, loading: false };
+$('messages').addEventListener('scroll', async (e) => {
+  if (e.target.scrollTop > 40 || histState.complete || histState.loading || !current) return;
+  histState.loading = true;
+  histState.limit += HISTORY_PAGE;
+  await openTextChannel(currentChannel(), 'older');
+  histState.loading = false;
+});
+
+let lastGroup = null;
 
 function appendMessage(m, scroll = true) {
+  const room = current;
   const list = $('messages');
+  // A file nobody keeps any more disappears from the chat.
+  if (m.file && !m.text && room.files.isGone(m.file.id)) return;
   const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 120;
-  const mentioned = m.author.userId !== userId && mentionsMe(m.text, state.name);
+  const mine = m.author.id === room.selfId;
+  const mentioned = !mine && mentionsMe(m.text, state.name);
   const content = h('div', { class: 'msg-body' });
   if (m.text) content.append(renderText(m.text, state.name));
-  if (m.file) content.append(fileCard(m));
-
-  const grouped = lastGroup && lastGroup.authorId === m.author.userId && m.ts - lastGroup.ts < 5 * 60 * 1000 && !m.file && !lastGroup.file;
-  if (grouped) {
-    list.append(h('div', { class: `msg-line${mentioned ? ' mentioned' : ''}`, title: formatTime(m.ts) }, content));
-  } else {
-    list.append(
-      h(
+  if (m.file) content.append(fileCard(room, m));
+  const grouped = lastGroup && lastGroup.author === m.author.id && m.ts - lastGroup.ts < 300000 && !m.file && !lastGroup.file;
+  const el = grouped
+    ? h('div', { class: `msg-line${mentioned ? ' mentioned' : ''}`, title: formatTime(m.ts), dataset: { msg: m.id } }, content)
+    : h(
         'div',
-        { class: `msg-group${mentioned ? ' mentioned' : ''}` },
-        avatar(m.author.name, 'lg'),
-        h('div', { class: 'msg-head' }, h('span', { class: 'msg-author' }, m.author.name), h('span', { class: 'msg-time' }, formatTime(m.ts))),
+        { class: `msg-group${mentioned ? ' mentioned' : ''}`, dataset: { msg: m.id } },
+        memberAvatar(m.author.id, m.author.name, 'lg'),
+        h('div', { class: 'msg-head' }, h('span', { class: 'msg-author', style: { color: colorFor(m.author.id) } }, m.author.name), h('span', { class: 'msg-time' }, formatTime(m.ts))),
         content,
-      ),
-    );
-  }
-  lastGroup = { authorId: m.author.userId, ts: m.ts, file: !!m.file };
-  if (scroll && (nearBottom || m.author.userId === userId)) list.scrollTop = list.scrollHeight;
+      );
+  list.append(el);
+  lastGroup = { author: m.author.id, ts: m.ts, file: !!m.file };
+  if (scroll && (nearBottom || mine)) list.scrollTop = list.scrollHeight;
+}
+
+function memberAvatar(id, name, size = '', speaking = false) {
+  return h('div', { class: `avatar ${size}${speaking ? ' speaking' : ''}`, style: { background: colorFor(id) }, title: `${name} · ${id.slice(0, 8)}` }, initials(name));
 }
 
 // ---------------------------------------------------------------------------
@@ -654,101 +555,126 @@ function appendMessage(m, scroll = true) {
 // ---------------------------------------------------------------------------
 const fileCards = new Map(); // fileId -> Set(card api)
 
-function fileKind(meta) {
-  const t = meta.type || '';
-  if (t.startsWith('image/')) return 'image';
-  if (t.startsWith('audio/')) return 'audio';
-  if (t.startsWith('video/')) return 'video';
+function fileKind(type = '') {
+  if (type.startsWith('image/')) return 'image';
+  if (type.startsWith('audio/')) return 'audio';
+  if (type.startsWith('video/')) return 'video';
   return 'other';
 }
 
-function fileCard(m) {
+function fileCard(room, m) {
   const meta = m.file;
-  const kind = fileKind(meta);
+  const files = room.files;
+  const wrap = h('div', { class: 'file-wrap', dataset: { file: meta.id } });
   const bar = h('div');
   const progress = h('div', { class: 'progress hidden' }, bar);
-  const status = h('div', { class: 'file-size' }, formatBytes(meta.size));
-  const actionBtn = h('button', { class: 'icon-btn', title: 'Download' }, icon('download'));
+  const status = h('div', { class: 'file-size' });
+  const holdersEl = h('div', { class: 'file-holders' });
+  const actions = h('div', { class: 'file-actions' });
   const preview = h('div', { class: 'file-preview' });
   const card = h(
     'div',
     { class: 'file-card' },
     icon('file', 28),
-    h('div', { class: 'file-info' }, h('div', { class: 'file-name', title: meta.name }, meta.name), status, progress),
-    actionBtn,
+    h('div', { class: 'file-info' }, h('div', { class: 'file-name', title: meta.name }, meta.name), status, holdersEl, progress),
+    actions,
   );
-  const wrap = h('div', {}, preview, card);
+  wrap.append(preview, card);
+  let shownPreview = false;
+  const btn = (name, title, fn) => h('button', { class: 'icon-btn', title, onclick: fn }, icon(name, 18));
 
+  const update = () => {
+    if (files.isGone(meta.id)) {
+      // Everyone deleted it: it disappears from the chat.
+      const msgEl = wrap.closest('[data-msg]');
+      if (msgEl && !m.text) msgEl.remove();
+      else wrap.replaceChildren(h('div', { class: 'muted small' }, `${meta.name} was deleted by everyone`));
+      return;
+    }
+    const local = files.hasLocal(meta.id);
+    const holders = files.holdersOf(meta.id).length;
+    const downloading = files.downloads.has(meta.id);
+    if (!downloading) status.textContent = formatBytes(meta.size);
+    holdersEl.textContent = `Stored on ${holders} device${holders === 1 ? '' : 's'}${local ? ' (incl. this PC)' : ''}`;
+    progress.classList.toggle('hidden', !downloading);
+    const buttons = [];
+    if (local) {
+      buttons.push(btn('save', 'Save a copy…', () => window.voice.files.saveAs(room.id, meta.id, meta.name)));
+      buttons.push(btn('external', 'Open', () => window.voice.files.open(room.id, meta.id, meta.name)));
+      buttons.push(
+        btn('trash', 'Delete from this PC', async () => {
+          const last = holders <= 1;
+          const ok = await confirmModal(
+            'Delete file from this PC',
+            last
+              ? `You are the last member storing "${meta.name}". Deleting it removes it from the chat for everyone.`
+              : `"${meta.name}" stays available from the ${holders - 1} other member(s) who store it.`,
+            'Delete',
+            true,
+          );
+          if (ok) await files.deleteLocal(meta.id);
+          update();
+        }),
+      );
+    } else if (!downloading) {
+      buttons.push(
+        btn('download', holders ? 'Download to this PC' : 'Nobody online has this file', () => {
+          files.download(meta).catch((err) => toast(err.message, 'error'));
+          update();
+        }),
+      );
+    }
+    actions.replaceChildren(...buttons);
+    const kind = fileKind(meta.type);
+    if (local && !shownPreview && kind !== 'other') {
+      shownPreview = true;
+      const src = files.url(meta);
+      if (kind === 'image') preview.replaceChildren(h('img', { src, alt: meta.name, loading: 'lazy', onclick: () => openImage(src, meta.name) }));
+      if (kind === 'video') preview.replaceChildren(h('video', { src, controls: true, preload: 'metadata' }));
+      if (kind === 'audio') preview.replaceChildren(h('audio', { src, controls: true, preload: 'none' }));
+    } else if (!local && shownPreview) {
+      shownPreview = false;
+      preview.replaceChildren();
+    }
+  };
   const api = {
-    el: wrap,
+    update,
     progress(frac) {
-      if (frac == null) {
-        progress.classList.add('hidden');
-        status.textContent = formatBytes(meta.size);
-        return;
-      }
-      progress.classList.toggle('hidden', frac >= 1);
+      if (frac == null || frac >= 1) return update();
+      progress.classList.remove('hidden');
       bar.style.width = `${Math.round(frac * 100)}%`;
-      status.textContent = frac >= 1 ? formatBytes(meta.size) : `${formatBytes(meta.size * frac)} / ${formatBytes(meta.size)}`;
-      if (frac >= 1) showReady();
+      status.textContent = `${formatBytes(meta.size * frac)} / ${formatBytes(meta.size)}`;
     },
   };
   if (!fileCards.has(meta.id)) fileCards.set(meta.id, new Set());
   fileCards.get(meta.id).add(api);
-
-  let ready = false;
-  async function showReady() {
-    if (ready) return;
-    const url = await files?.urlFor(meta.id);
-    if (!url) return;
-    ready = true;
-    actionBtn.replaceChildren(icon('save'));
-    actionBtn.title = 'Save to disk';
-    if (kind === 'image') preview.replaceChildren(h('img', { src: url, alt: meta.name, onclick: () => openImage(url, meta.name) }));
-    if (kind === 'video') preview.replaceChildren(h('video', { src: url, controls: true, preload: 'metadata' }));
-    if (kind === 'audio') preview.replaceChildren(h('audio', { src: url, controls: true, preload: 'metadata' }));
-  }
-
-  async function download() {
-    if (!files) return;
-    try {
-      progress.classList.remove('hidden');
-      await files.download(meta, m.author.userId);
-    } catch (err) {
-      progress.classList.add('hidden');
-      status.textContent = `${formatBytes(meta.size)} — ${err.message}`;
-    }
-  }
-
-  actionBtn.onclick = async () => {
-    if (ready) {
-      const url = await files.urlFor(meta.id);
-      h('a', { href: url, download: meta.name }).click();
-    } else {
-      download();
-    }
-  };
-
-  // Already have it locally (we sent it, or downloaded before)?
-  files?.getLocal(meta.id).then((blob) => {
-    if (blob) showReady();
-    else if (kind !== 'other' && meta.size <= AUTO_DOWNLOAD_LIMIT) download();
-  });
-  if (files?.isDownloading(meta.id)) progress.classList.remove('hidden');
+  update();
   return wrap;
 }
 
-function updateFileProgress(fileId, frac) {
-  const set = fileCards.get(fileId);
-  if (!set) return;
-  for (const api of set) {
-    if (!api.el.isConnected) set.delete(api);
-    else api.progress(frac);
-  }
+function updateFileCards(fileId) {
+  for (const api of fileCards.get(fileId) || []) api.update();
 }
 
-function openImage(url, name) {
-  modal({ title: name, body: h('img', { src: url, style: { maxWidth: '100%', borderRadius: '8px' } }) });
+function updateFileProgress(fileId, frac) {
+  for (const api of fileCards.get(fileId) || []) api.progress(frac);
+}
+
+function openImage(src, name) {
+  modal({ title: name, body: h('img', { src, style: { maxWidth: '100%', borderRadius: '8px' } }) });
+}
+
+async function shareFiles(list) {
+  if (!current) return;
+  const room = current;
+  const channel = currentChannel();
+  for (const file of list) {
+    try {
+      await room.shareFile(channel, file);
+    } catch (err) {
+      toast(`Could not share ${file.name}: ${err.message}`, 'error');
+    }
+  }
 }
 
 // Composer
@@ -759,20 +685,20 @@ const autosize = () => {
 };
 input.addEventListener('input', () => {
   autosize();
-  if (Date.now() - lastTyping > 2500 && input.value.trim()) {
+  if (current && Date.now() - lastTyping > 2500 && input.value.trim()) {
     lastTyping = Date.now();
-    mesh?.broadcast({ t: 'typing', channel: state.textChannel });
+    current.sendTyping(currentChannel());
   }
 });
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     const text = input.value.trim();
-    if (!text) return;
+    if (!text || !current) return;
     input.value = '';
     autosize();
     lastTyping = 0;
-    sendMessage(text.slice(0, MAX_MESSAGE));
+    current.sendMessage(currentChannel(), text.slice(0, MAX_MESSAGE));
   }
 });
 input.addEventListener('paste', (e) => {
@@ -789,7 +715,6 @@ $('file-input').onchange = (e) => {
   e.target.value = '';
 };
 
-// Drag & drop
 let dragDepth = 0;
 const chat = $('chat');
 chat.addEventListener('dragenter', (e) => {
@@ -809,22 +734,15 @@ chat.addEventListener('drop', (e) => {
   const dropped = [...(e.dataTransfer?.files || [])];
   if (dropped.length) shareFiles(dropped);
 });
-// Never let a stray drop navigate the window away.
 window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', (e) => e.preventDefault());
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
-function showMain() {
-  $('connect-view').classList.add('hidden');
-  $('main-view').classList.remove('hidden');
-  $('main-view').classList.toggle('no-members', !state.membersVisible);
-}
-
 function renderAll() {
-  $('server-name').textContent = state.serverName;
-  $('host-badge').classList.toggle('hidden', !state.hosting);
+  renderRail();
+  renderHeader();
   renderChannels();
   renderMembers();
   renderVoicePanel();
@@ -836,33 +754,54 @@ function renderVoiceState() {
   renderMembers();
   renderVoicePanel();
   renderSelf();
+  renderRail();
 }
 
-function allMembers() {
-  const self = { id: state.selfId, userId, name: state.name, voice: state.voice, muted: state.muted, deafened: state.deafened, self: true };
-  return [self, ...state.peers.values()];
+function renderRail() {
+  const items = [...rooms.values()].map((room) => {
+    const unread = [...room.unread.values()].some((n) => n > 0);
+    return h(
+      'button',
+      {
+        class: `rail-item${room === current ? ' active' : ''}${unread ? ' unread' : ''}`,
+        style: { background: colorFor(room.id) },
+        title: room.name,
+        dataset: { room: room.id },
+        onclick: () => selectRoom(room),
+      },
+      initials(room.name),
+      room === voiceRoom ? h('span', { class: 'voice-badge' }) : null,
+    );
+  });
+  $('rail').replaceChildren(
+    ...items,
+    h('div', { class: 'rail-sep' }),
+    h('button', { class: 'rail-item rail-add', title: 'Create or join a room', onclick: () => showWelcome(!!current) }, icon('plus', 22)),
+  );
 }
 
-function isSpeaking(member) {
-  if (member.self) return audio.transmitting && !!state.voice;
-  return !!mesh?.peers.get(member.id)?.speaking;
+function renderHeader() {
+  if (!current) return;
+  $('room-name').textContent = current.name;
+  const peers = current.overlay.roster().length;
+  const reachable = state.rvStatus.relays.some((r) => r.open) || state.rvStatus.lan;
+  const dot = $('net-dot');
+  dot.className = `net-dot ${peers ? 'ok' : reachable ? '' : 'bad'}`;
+  dot.title = peers ? `${peers} member(s) online` : reachable ? 'Waiting for members…' : 'Offline: no rendezvous relay reachable and LAN discovery off';
+}
+
+function isSpeaking(room, member) {
+  if (member.self) return audio.transmitting && voiceRoom === room;
+  return room === voiceRoom && !!(room.overlay.peers.get(member.id)?.speaking || media.isSpeaking(member.id));
 }
 
 function renderChannels() {
-  const list = $('channel-list');
-  const text = state.channels.filter((c) => c.type === 'text');
-  const voice = state.channels.filter((c) => c.type === 'voice');
-  const members = allMembers();
-
+  if (!current) return;
+  const room = current;
+  const members = room.members();
   const section = (label, type) =>
-    h(
-      'div',
-      { class: 'channel-section' },
-      label,
-      h('button', { class: 'icon-btn', title: `Create ${type} channel`, onclick: () => createChannel(type) }, icon('plus', 16)),
-    );
-
-  const deleteBtn = (c) =>
+    h('div', { class: 'channel-section' }, label, h('button', { class: 'icon-btn', title: `Create ${type} channel`, onclick: () => createChannel(type) }, icon('plus', 16)));
+  const del = (c) =>
     h(
       'button',
       {
@@ -870,82 +809,92 @@ function renderChannels() {
         title: 'Delete channel',
         onclick: async (e) => {
           e.stopPropagation();
-          if (await confirmModal('Delete channel', `Delete "${c.name}" for everyone on this server?`, 'Delete', true)) {
-            signaling.send({ type: 'channel-delete', id: c.id });
-          }
+          if (await confirmModal('Delete channel', `Delete "${c.name}" for everyone in this room?`, 'Delete', true)) room.applyOp({ kind: 'channel-del', cid: c.id });
         },
       },
       icon('trash', 14),
     );
-
-  list.replaceChildren(
+  const textCh = currentChannel();
+  $('channel-list').replaceChildren(
     section('Text channels', 'text'),
-    ...text.map((c) => {
-      const unread = state.unread.get(c.id) || 0;
-      return h(
-        'div',
-        {
-          class: `channel${c.id === state.textChannel ? ' selected' : ''}${unread ? ' unread' : ''}`,
-          onclick: () => openTextChannel(c.id),
-          dataset: { channel: c.id },
-        },
-        icon('hash', 18),
-        h('span', { class: 'name' }, c.name),
-        unread ? h('span', { class: 'unread-count' }, unread > 99 ? '99+' : unread) : null,
-        deleteBtn(c),
-      );
-    }),
-    section('Voice channels', 'voice'),
-    ...voice.flatMap((c) => {
-      const inside = members.filter((m) => m.voice === c.id);
-      return [
-        h(
+    ...room.channels
+      .filter((c) => c.type === 'text')
+      .map((c) => {
+        const unread = room.unread.get(c.id) || 0;
+        return h(
           'div',
-          { class: `channel${c.id === state.voice ? ' selected' : ''}`, onclick: () => joinVoice(c.id), title: 'Join voice channel', dataset: { voice: c.id } },
-          icon('speaker', 18),
+          { class: `channel${c.id === textCh ? ' selected' : ''}${unread ? ' unread' : ''}`, onclick: () => openTextChannel(c.id), dataset: { channel: c.id } },
+          icon('hash', 18),
           h('span', { class: 'name' }, c.name),
-          deleteBtn(c),
-        ),
-        inside.length
-          ? h(
-              'div',
-              { class: 'voice-members' },
-              ...inside.map((m) =>
-                h(
-                  'div',
-                  { class: 'voice-member', dataset: { member: m.id }, onclick: (e) => openMemberPopover(e.currentTarget, m) },
-                  avatar(m.name, 'sm', isSpeaking(m)),
-                  h('span', { class: 'name' }, m.name),
-                  h('span', { class: 'status-icons' }, m.muted ? icon('micOff', 14) : null, m.deafened ? icon('headphonesOff', 14) : null),
+          unread ? h('span', { class: 'unread-count' }, unread > 99 ? '99+' : unread) : null,
+          del(c),
+        );
+      }),
+    section('Voice channels', 'voice'),
+    ...room.channels
+      .filter((c) => c.type === 'voice')
+      .flatMap((c) => {
+        const inside = members.filter((m) => m.info.voice === c.id);
+        return [
+          h(
+            'div',
+            { class: `channel${room === voiceRoom && c.id === voiceChannel ? ' selected' : ''}`, onclick: () => joinVoice(c.id), title: 'Join voice channel', dataset: { voice: c.id } },
+            icon('speaker', 18),
+            h('span', { class: 'name' }, c.name),
+            del(c),
+          ),
+          inside.length
+            ? h(
+                'div',
+                { class: 'voice-members' },
+                ...inside.map((m) =>
+                  h(
+                    'div',
+                    { class: 'voice-member', dataset: { member: m.id }, onclick: (e) => openMemberPopover(e.currentTarget, m) },
+                    memberAvatar(m.id, m.info.name, 'sm', isSpeaking(room, m)),
+                    h('span', { class: 'name' }, m.info.name),
+                    h('span', { class: 'status-icons' }, m.info.muted ? icon('micOff', 14) : null, m.info.deafened ? icon('headphonesOff', 14) : null),
+                  ),
                 ),
-              ),
-            )
-          : null,
-      ].filter(Boolean);
-    }),
+              )
+            : null,
+        ].filter(Boolean);
+      }),
   );
 }
 
-/** Cheap update of speaking rings without re-rendering lists. */
 function renderSpeaking() {
-  for (const m of allMembers()) {
-    const speaking = isSpeaking(m);
-    document.querySelectorAll(`[data-member="${CSS.escape(m.id || '')}"] .avatar`).forEach((el) => el.classList.toggle('speaking', speaking));
+  if (!current) return;
+  for (const m of current.members()) {
+    const speaking = isSpeaking(current, m);
+    for (const el of document.querySelectorAll(`[data-member="${m.id}"] .avatar`)) el.classList.toggle('speaking', speaking);
   }
   renderSelf();
 }
 
+function routeLabel(m) {
+  if (m.self) return 'You';
+  if (m.route?.path.length > 1) {
+    const via = m.route.path
+      .slice(0, -1)
+      .map((id) => current.overlay.ls.nodes.get(id)?.info.name || id.slice(0, 6))
+      .join(' → ');
+    return `via ${via} · ${Math.round(m.route.cost)} ms`;
+  }
+  if (m.direct) return `direct · ${m.rtt != null ? Math.round(m.rtt / 2) : '…'} ms`;
+  return 'connecting…';
+}
+
 function renderMembers() {
-  const el = $('members');
-  const members = allMembers();
-  const voiceName = (id) => state.channels.find((c) => c.id === id)?.name;
-  el.replaceChildren(
+  if (!current) return;
+  const room = current;
+  const voiceName = (id) => room.channels.find((c) => c.id === id)?.name;
+  const members = room.members();
+  $('members').replaceChildren(
     h('h4', {}, `Online — ${members.length}`),
     ...members.map((m) => {
-      const peer = m.self ? null : mesh?.peers.get(m.id);
-      const connState = m.self ? 'connected' : peer?.state || 'new';
-      const av = avatar(m.name, '', isSpeaking(m));
-      av.append(h('span', { class: `dot ${connState}`, title: m.self ? 'You' : `Peer connection: ${connState}` }));
+      const av = memberAvatar(m.id, m.info.name, '', isSpeaking(room, m));
+      av.append(h('span', { class: `dot ${m.self || m.direct || m.route ? 'connected' : 'connecting'}` }));
       return h(
         'div',
         { class: 'member', dataset: { member: m.id }, onclick: (e) => openMemberPopover(e.currentTarget, m) },
@@ -953,8 +902,13 @@ function renderMembers() {
         h(
           'div',
           { class: 'meta' },
-          h('div', { class: 'name' }, m.name, m.self ? h('span', { class: 'muted' }, ' (you)') : null),
-          h('div', { class: 'sub' }, m.voice ? `🔊 ${voiceName(m.voice) || ''}${m.muted ? ' · muted' : ''}${m.deafened ? ' · deafened' : ''}` : connState === 'connected' ? 'Online' : `P2P: ${connState}`),
+          h('div', { class: 'name' }, m.info.name, m.self ? h('span', { class: 'muted' }, ' (you)') : null),
+          h(
+            'div',
+            { class: 'sub' },
+            m.info.voice ? `🔊 ${voiceName(m.info.voice) || ''}${m.info.muted ? ' (muted)' : ''}${m.self ? '' : ' · '}` : '',
+            m.self && m.info.voice ? null : h('span', { class: 'route-tag' }, routeLabel(m)),
+          ),
         ),
       );
     }),
@@ -962,67 +916,73 @@ function renderMembers() {
 }
 
 function renderVoicePanel() {
-  const panel = $('voice-panel');
-  panel.classList.toggle('hidden', !state.voice);
-  if (!state.voice) return;
-  const ch = state.channels.find((c) => c.id === state.voice);
-  $('vp-channel').textContent = `${ch?.name || ''} / ${state.serverName}`;
+  $('voice-panel').classList.toggle('hidden', !voiceRoom);
+  if (!voiceRoom) return;
+  const ch = voiceRoom.channels.find((c) => c.id === voiceChannel);
+  $('vp-channel').textContent = `${ch?.name || ''} / ${voiceRoom.name}`;
 }
 
 function renderSelf() {
-  const av = $('self-avatar');
-  av.replaceWith(Object.assign(avatar(state.name, '', audio.transmitting && !!state.voice), { id: 'self-avatar' }));
+  $('self-avatar').replaceWith(Object.assign(memberAvatar(current?.selfId || 'me', state.name, '', audio.transmitting && !!voiceRoom), { id: 'self-avatar' }));
   $('self-name').textContent = state.name;
   const sub = $('self-sub');
   let text;
-  if (!state.voice) text = 'Not in voice';
+  if (!voiceRoom) text = 'Not in voice';
   else if (state.deafened) text = 'Deafened';
   else if (state.muted) text = 'Muted';
   else if (settings.inputMode === 'ptt') text = `Push to talk: ${describeBinding(settings.pttBinding)}`;
   else if (settings.inputMode === 'vad') text = 'Voice activity';
   else text = 'Open mic';
   sub.textContent = text;
-  sub.classList.toggle('tx', audio.transmitting && !!state.voice);
+  sub.classList.toggle('tx', audio.transmitting && !!voiceRoom);
   $('btn-mute').replaceChildren(icon(state.muted || state.deafened ? 'micOff' : 'mic'));
   $('btn-mute').classList.toggle('active-red', state.muted || state.deafened);
   $('btn-deafen').replaceChildren(icon(state.deafened ? 'headphonesOff' : 'headphones'));
   $('btn-deafen').classList.toggle('active-red', state.deafened);
 }
 
+let typingTimer = null;
 function renderTyping() {
+  if (!current) return;
   const now = Date.now();
   const names = [];
-  for (const [key, t] of state.typing) {
-    if (t.until < now) state.typing.delete(key);
-    else if (t.channel === state.textChannel) names.push(t.name);
+  for (const [id, t] of current.typing) {
+    if (t.until < now) current.typing.delete(id);
+    else if (t.channel === currentChannel()) names.push(t.name);
   }
   $('typing').textContent = names.length ? `${names.slice(0, 3).join(', ')} ${names.length > 1 ? 'are' : 'is'} typing…` : '';
+  // Only tick while someone is typing.
+  clearTimeout(typingTimer);
+  if (current.typing.size) typingTimer = setTimeout(renderTyping, 1000);
 }
-setInterval(renderTyping, 1000);
 
 async function createChannel(type) {
   const name = await promptModal(type === 'voice' ? 'Create voice channel' : 'Create text channel', 'Channel name');
-  if (name) signaling.send({ type: 'channel-create', name, channelType: type });
+  if (!name || !current) return;
+  const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'channel';
+  current.applyOp({ kind: 'channel-add', cid: `${base}-${Math.random().toString(36).slice(2, 6)}`, name, type });
 }
 
-// Member popover: volume, local mute, live connection stats
 function openMemberPopover(anchor, member) {
-  if (member.self) {
-    openSettings(appCtx, 'audio');
-    return;
-  }
-  const peer = mesh?.peers.get(member.id);
+  if (member.self) return openSettings(appCtx, 'audio');
+  const ov = current.overlay;
   const volumes = prefs.get('volumes', {});
-  const vol = Math.round((volumes[member.userId] ?? 1) * 100);
+  const vol = Math.round((volumes[member.id] ?? 1) * 100);
   const volLabel = h('span', {}, `${vol}%`);
   const statsEl = h('dl', { class: 'stats-grid' });
-  const localMuted = mesh?.localMutes.has(member.userId);
-
   const content = h(
     'div',
     {},
-    h('div', { class: 'row', style: { alignItems: 'center', marginBottom: '12px' } }, avatar(member.name, 'lg'), h('h3', {}, member.name)),
-    h('div', { class: 'setting' }, h('div', { class: 'label' }, 'User volume', volLabel),
+    h(
+      'div',
+      { class: 'row', style: { alignItems: 'center', marginBottom: '12px' } },
+      memberAvatar(member.id, member.info.name, 'lg'),
+      h('div', {}, h('h3', {}, member.info.name), h('div', { class: 'muted small mono' }, `ID ${member.id}`)),
+    ),
+    h(
+      'div',
+      { class: 'setting' },
+      h('div', { class: 'label' }, 'User volume', volLabel),
       h('input', {
         type: 'range',
         min: 0,
@@ -1031,9 +991,10 @@ function openMemberPopover(anchor, member) {
         oninput: (e) => {
           const v = Number(e.target.value) / 100;
           volLabel.textContent = `${e.target.value}%`;
-          mesh?.setUserVolume(member.userId, v);
+          ov.setUserVolume(member.id, v);
+          media.setVolume(member.id, v);
           const all = prefs.get('volumes', {});
-          all[member.userId] = v;
+          all[member.id] = v;
           prefs.set('volumes', all);
         },
       }),
@@ -1043,10 +1004,11 @@ function openMemberPopover(anchor, member) {
       { class: 'check' },
       h('input', {
         type: 'checkbox',
-        checked: localMuted,
+        checked: ov.localMutes.has(member.id),
         onchange: (e) => {
-          mesh?.setUserLocalMute(member.userId, e.target.checked);
-          prefs.set('localMutes', [...(mesh?.localMutes || [])]);
+          ov.setUserLocalMute(member.id, e.target.checked);
+          media.setLocalMute(member.id, e.target.checked);
+          prefs.set('localMutes', [...ov.localMutes]);
         },
       }),
       h('div', {}, 'Mute for me'),
@@ -1054,101 +1016,122 @@ function openMemberPopover(anchor, member) {
     h('div', { class: 'label muted small', style: { marginTop: '8px', fontWeight: 700 } }, 'CONNECTION'),
     statsEl,
   );
-
-  const fmt = (v, unit, digits = 0) => (v == null || Number.isNaN(v) ? '—' : `${v.toFixed(digits)} ${unit}`);
+  const fmt = (v, unit, d = 0) => (v == null || Number.isNaN(v) ? '—' : `${v.toFixed(d)} ${unit}`);
   const refresh = async () => {
-    if (!peer) {
-      statsEl.replaceChildren(h('dt', {}, 'Status'), h('dd', {}, 'no connection'));
-      return;
+    const peer = ov.peers.get(member.id);
+    const m = ov.roster().find((x) => x.id === member.id) || member;
+    const r = ov.audioRoutes.get(member.id);
+    const audioRoute = !r ? '—' : r.mode === 'direct' ? 'direct (WebRTC)' : r.mode === 'relay' ? (r.path.length > 1 ? 'relayed, E2E encrypted' : 'ultra pipeline') : 'none';
+    const rows = [
+      ['Route', routeLabel(m)],
+      ['My audio to them', audioRoute],
+    ];
+    const s = peer && (await peer.getStats().catch(() => null));
+    if (s) {
+      rows.push(
+        ['Network path', s.path || '—'],
+        ['Round trip', fmt(s.rttMs, 'ms')],
+        ['Receiving', fmt(s.inKbps, 'kbps')],
+        ['Sending', fmt(s.outKbps, 'kbps')],
+        ['Packet loss', fmt(s.lossPct, '%', 1)],
+        ['Jitter buffer', fmt(s.bufferMs, 'ms')],
+        ['Codec in', s.codec || '—'],
+        ['Encoder', s.sendCodec || '—'],
+      );
     }
-    const s = await peer.getStats().catch(() => null);
-    if (!s) return;
-    statsEl.replaceChildren(
-      h('dt', {}, 'Status'),
-      h('dd', {}, peer.state),
-      h('dt', {}, 'Path'),
-      h('dd', {}, s.path || '—'),
-      h('dt', {}, 'Round trip'),
-      h('dd', {}, fmt(s.rttMs, 'ms')),
-      h('dt', {}, 'Receiving'),
-      h('dd', {}, fmt(s.inKbps, 'kbps')),
-      h('dt', {}, 'Sending'),
-      h('dd', {}, fmt(s.outKbps, 'kbps')),
-      h('dt', {}, 'Packet loss'),
-      h('dd', {}, fmt(s.lossPct, '%', 1)),
-      h('dt', {}, 'Network jitter'),
-      h('dd', {}, fmt(s.jitterMs, 'ms', 1)),
-      h('dt', {}, 'Jitter buffer'),
-      h('dd', {}, fmt(s.bufferMs, 'ms')),
-      h('dt', {}, 'Codec in'),
-      h('dd', { title: s.codec || '' }, s.codec || '—'),
-      h('dt', {}, 'Encoder'),
-      h('dd', { title: s.sendCodec || '' }, s.sendCodec || '—'),
-    );
+    statsEl.replaceChildren(...rows.flatMap(([k, v]) => [h('dt', {}, k), h('dd', { title: v }, v)]));
   };
   refresh();
   const timer = setInterval(refresh, 1000);
   popover(anchor, content, () => clearInterval(timer));
 }
 
-function openServerInfo() {
-  const body = h('div');
-  const copyRow = (text) =>
-    h(
-      'div',
-      { class: 'copy-row' },
-      h('span', {}, text),
-      h(
-        'button',
-        {
-          class: 'icon-btn',
-          title: 'Copy',
-          onclick: () => {
-            navigator.clipboard.writeText(text);
-            toast('Copied');
-          },
-        },
-        icon('copy', 16),
+async function openRoomMenu() {
+  if (!current) return;
+  const room = current;
+  const nameInput = h('input', { value: room.name, maxlength: 40 });
+  const storage = h('div');
+  const renderStorage = async () => {
+    const list = await window.voice.files.list(room.id);
+    const names = new Map();
+    for (const c of room.channels) for (const m of await store.getMessages(room.id, c.id, 2000)) if (m.file) names.set(m.file.id, m.file.name);
+    storage.replaceChildren(
+      h('div', { class: 'hint' }, `${list.length} file(s), ${formatBytes(list.reduce((n, f) => n + f.size, 0))} stored on this PC`),
+      ...list.map((f) =>
+        h(
+          'div',
+          { class: 'storage-row' },
+          h('span', { class: 'grow' }, names.get(f.fileId) || f.fileId),
+          h('span', { class: 'muted' }, formatBytes(f.size)),
+          h(
+            'button',
+            {
+              class: 'icon-btn',
+              title: 'Delete from this PC',
+              onclick: async () => {
+                await room.files.deleteLocal(f.fileId);
+                renderStorage();
+                updateFileCards(f.fileId);
+              },
+            },
+            icon('trash', 16),
+          ),
+        ),
       ),
     );
-  const render = async () => {
-    const status = state.hosting ? await window.voice.serverStatus() : null;
-    body.replaceChildren(
-      h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Connected to'), copyRow(signaling.url || '')),
-      status?.running
-        ? h(
-            'div',
-            {},
-            h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Share one of these addresses'),
-              ...status.addresses.map((a) => copyRow(`${a}:${status.port}`)),
-              h('div', { class: 'hint' },
-                'Same network: use the address above. Over the internet: forward TCP port ',
-                h('strong', {}, String(status.port)),
-                ' on your router to this PC and share your public IP. Only the small signaling connection uses this port — voice, chat and files go directly between peers.',
-              ),
-            ),
-            h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Server log'), h('div', { class: 'log' }, status.log.join('\n') || '—')),
-          )
-        : null,
-    );
   };
-  render();
-  const leaveBtn = h('button', { class: 'btn danger' }, state.hosting ? 'Stop server & leave' : 'Leave server');
-  const m = modal({ title: state.serverName, small: true, body, footer: [leaveBtn] });
-  leaveBtn.onclick = () => {
+  renderStorage();
+  const body = h(
+    'div',
+    {},
+    h(
+      'div',
+      { class: 'setting' },
+      h('div', { class: 'label' }, 'Invite code'),
+      h('div', { class: 'copy-row' }, h('span', { class: 'invite-code' }, room.invite), h('button', { class: 'icon-btn', onclick: () => copy(room.invite) }, icon('copy', 16))),
+    ),
+    h(
+      'div',
+      { class: 'setting' },
+      h('div', { class: 'label' }, 'Room name'),
+      h(
+        'div',
+        { class: 'row' },
+        nameInput,
+        h(
+          'button',
+          {
+            class: 'btn',
+            onclick: () => {
+              const v = nameInput.value.trim();
+              if (v && v !== room.name) room.applyOp({ kind: 'name', value: v });
+            },
+          },
+          'Rename',
+        ),
+      ),
+    ),
+    h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Files on this PC'), storage),
+  );
+  const leaveBtn = h('button', { class: 'btn danger' }, 'Leave room');
+  const m = modal({ title: room.name, small: true, body, footer: [leaveBtn] });
+  leaveBtn.onclick = async () => {
+    const ok = await confirmModal('Leave room', 'Your copy of the chat history and files is deleted from this PC. You can rejoin with the invite code.', 'Leave', true);
+    if (!ok) return;
     m.close();
-    leaveServer();
+    leaveRoom(room);
   };
 }
 
-// Static buttons
 $('btn-leave-voice').append(icon('hangup'));
 $('btn-leave-voice').onclick = () => leaveVoice();
 $('btn-mute').onclick = () => setMuted(!state.muted);
 $('btn-deafen').onclick = () => setDeafened(!state.deafened);
 $('btn-settings').append(icon('settings'));
 $('btn-settings').onclick = () => openSettings(appCtx);
-$('server-header').onclick = openServerInfo;
+$('room-header').onclick = openRoomMenu;
+$('btn-invite').append(icon('userPlus'));
+$('btn-invite').onclick = () => current && showInvite(current.invite);
 $('btn-toggle-members').append(icon('users'));
 $('btn-toggle-members').onclick = () => {
   state.membersVisible = !state.membersVisible;
@@ -1156,42 +1139,74 @@ $('btn-toggle-members').onclick = () => {
   $('main-view').classList.toggle('no-members', !state.membersVisible);
 };
 window.addEventListener('resize', debounce(closePopover, 100));
+window.voice.rendezvous.onStatus((s) => {
+  const before = state.rvStatus.relays.filter((r) => r.open).length;
+  state.rvStatus = s;
+  // A relay (re)connected: announce ourselves again so we're found quickly.
+  if (s.relays.filter((r) => r.open).length > before) for (const r of rooms.values()) r.overlay._hello();
+  renderHeader();
+});
 
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 async function boot() {
   state.appInfo = await window.voice.info();
+  const arg = (k) => {
+    const a = state.appInfo.args.find((x) => x === `--voice-${k}` || x.startsWith(`--voice-${k}=`));
+    return a === undefined ? undefined : a.includes('=') ? a.split('=').slice(1).join('=') : true;
+  };
+  // Automation / testing overrides.
+  if (arg('relays') !== undefined) settings.relays = String(arg('relays')).split(',').filter(Boolean);
+  if (arg('no-lan')) settings.lan = false;
+  if (arg('name')) state.name = String(arg('name'));
+  await window.voice.rendezvous.configure({ relays: settings.relays, lan: settings.lan });
+  state.rvStatus = await window.voice.rendezvous.status();
+
   sfx.enabled = settings.sounds;
   sfx.setSink(settings.outputDeviceId);
   audio.setMuted(state.muted);
   audio.setDeafened(state.deafened);
   await bindPtt();
-  renderConnect();
   if (settings.notifications && Notification.permission === 'default') Notification.requestPermission();
 
-  // Automation / power users: --voice-name=… --voice-connect=host:port --voice-host[=port]
-  const arg = (k) => state.appInfo.args.find((a) => a === `--voice-${k}` || a.startsWith(`--voice-${k}=`))?.split('=').slice(1).join('=');
-  const argName = arg('name');
-  if (argName) {
-    state.name = argName;
-    $('cv-name').value = argName;
-  }
-  const hostArg = state.appInfo.args.find((a) => a.startsWith('--voice-host'));
-  const connectArg = arg('connect');
-  try {
-    if (hostArg) {
-      $('hv-port').value = hostArg.includes('=') ? hostArg.split('=')[1] : 9987;
-      $('host-form').requestSubmit();
-    } else if (connectArg) {
-      await connect(connectArg, arg('password') || '', { remember: false });
+  for (const record of await store.listRooms()) {
+    try {
+      await startRoom(record);
+    } catch (err) {
+      console.warn('could not start room', err);
     }
+  }
+  const last = rooms.get(prefs.get('lastRoom', '')) || rooms.values().next().value;
+  if (last) selectRoom(last);
+  else showWelcome();
+
+  try {
+    if (arg('create')) await createRoom(String(arg('create')));
+    if (arg('join')) await joinRoom(String(arg('join')));
   } catch (err) {
-    console.warn('auto-connect failed', err);
+    console.warn('auto-join failed', err);
   }
 }
 
 boot();
 
-// Exposed for debugging / automated tests.
-window.__voice = { state, settings, audio, get mesh() { return mesh; }, get files() { return files; }, joinVoice, leaveVoice, sendMessage, shareFiles, openTextChannel };
+// For debugging and automated tests.
+window.__voice = {
+  settings,
+  audio,
+  media,
+  rooms,
+  get current() {
+    return current;
+  },
+  get voiceRoom() {
+    return voiceRoom;
+  },
+  createRoom,
+  joinRoom,
+  joinVoice,
+  leaveVoice,
+  shareFiles,
+  selectRoom,
+};

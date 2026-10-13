@@ -1,34 +1,32 @@
 import { Emitter } from './util.js';
 
 /**
- * Microphone capture, voice activity detection and push-to-talk.
+ * Microphone capture.
  *
- * Latency notes:
- *   - The captured track is sent to WebRTC directly. No WebAudio processing
- *     sits in the send path, so it adds zero extra buffering.
- *   - Level metering / VAD runs on a *clone* of the track, so disabling the
- *     sent track (mute, PTT released) never blinds the detector.
- *   - Gating is done with `track.enabled`, which takes effect immediately.
+ * - The raw mic track goes straight into WebRTC for direct connections
+ *   (zero extra buffering).
+ * - A *clone* of the track feeds the capture worklet on the audio thread,
+ *   which does level metering, voice activity detection and owns the
+ *   transmit gate; it also taps PCM for the custom pipeline when needed.
+ *   No main-thread timers run for audio.
  */
 export class AudioEngine extends Emitter {
   constructor(settings) {
     super();
     this.settings = settings;
-    this.stream = null;
     this.track = null;
     this.ctx = null;
-    this.analyser = null;
+    this.node = null;
     this._analysisTrack = null;
-    this._timer = null;
     this.muted = false;
     this.deafened = false;
     this.pttDown = false;
-    this._pttReleaseTimer = null;
-    this.vadOpen = false;
-    this._vadHoldUntil = 0;
+    this._pttTimer = null;
     this.level = -100;
     this.transmitting = false;
     this._loopback = null;
+    this._meterUsers = 0;
+    this._pcm = null;
   }
 
   constraints() {
@@ -59,84 +57,87 @@ export class AudioEngine extends Emitter {
       stream = await navigator.mediaDevices.getUserMedia(this.constraints());
     } catch (err) {
       if (this.settings.inputDeviceId && (err.name === 'OverconstrainedError' || err.name === 'NotFoundError')) {
-        // Saved device is gone: fall back to the system default.
         this.settings.inputDeviceId = '';
         stream = await navigator.mediaDevices.getUserMedia(this.constraints());
       } else {
         throw err;
       }
     }
-    this.stream = stream;
     this.track = stream.getAudioTracks()[0];
     this.track.contentHint = this.settings.echoCancellation || this.settings.noiseSuppression ? 'speech' : 'music';
     this.track.onended = () => this.emit('device-lost');
-    this._setupAnalysis();
-    this._applyGate();
+    this.track.enabled = false;
+    await this._setupWorklet();
     this.emit('track', this.track);
     return this.track;
   }
 
+  async _setupWorklet() {
+    this.ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
+    await this.ctx.audioWorklet.addModule(new URL('./worklets/capture.js', import.meta.url));
+    this._analysisTrack = this.track.clone();
+    this._analysisTrack.enabled = true;
+    const src = this.ctx.createMediaStreamSource(new MediaStream([this._analysisTrack]));
+    this.node = new AudioWorkletNode(this.ctx, 'voice-capture', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 2, channelCountMode: 'explicit' });
+    this.node.port.onmessage = (e) => {
+      const d = e.data;
+      if (typeof d.level === 'number') {
+        this.level = d.level;
+        this.emit('level', d.level);
+      }
+      if (typeof d.tx === 'boolean') {
+        if (this.track) this.track.enabled = d.tx;
+        this._setTransmitting(d.tx);
+      }
+    };
+    src.connect(this.node);
+    this.syncGate();
+    this.node.port.postMessage({ meter: this._meterUsers > 0 });
+    if (this._pcm) this.node.port.postMessage(this._pcm);
+  }
+
   stop() {
-    clearInterval(this._timer);
-    this._timer = null;
     this.stopLoopback();
     this._analysisTrack?.stop();
     this._analysisTrack = null;
     this.track?.stop();
     this.track = null;
-    this.stream = null;
-    if (this.ctx) this.ctx.close().catch(() => {});
+    this.node = null;
+    this.ctx?.close().catch(() => {});
     this.ctx = null;
     this._setTransmitting(false);
     this.emit('track', null);
   }
 
-  /** Re-acquire the microphone (device or processing settings changed). */
   async restart() {
-    const wasRunning = this.running;
+    if (!this.running) return;
     const loop = !!this._loopback;
-    if (!wasRunning) return;
     this.stop();
     await this.start();
     if (loop) this.startLoopback();
   }
 
-  _setupAnalysis() {
-    this.ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
-    this._analysisTrack = this.track.clone();
-    this._analysisTrack.enabled = true;
-    const src = this.ctx.createMediaStreamSource(new MediaStream([this._analysisTrack]));
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 1024;
-    src.connect(this.analyser);
-    const buf = new Float32Array(this.analyser.fftSize);
-    clearInterval(this._timer);
-    this._timer = setInterval(() => {
-      this.analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-      const rms = Math.sqrt(sum / buf.length);
-      this.level = rms > 0 ? Math.max(-100, 20 * Math.log10(rms)) : -100;
-      const now = performance.now();
-      if (this.level >= this.settings.vadThreshold) this._vadHoldUntil = now + this.settings.vadHoldMs;
-      const open = now < this._vadHoldUntil;
-      if (open !== this.vadOpen) {
-        this.vadOpen = open;
-        this._applyGate();
-      }
-      this.emit('level', this.level);
-    }, 10);
+  /** Push gate parameters (mode, threshold, mute, PTT) to the worklet. */
+  syncGate() {
+    const s = this.settings;
+    this.node?.port.postMessage({ mode: s.inputMode, threshold: s.vadThreshold, holdMs: s.vadHoldMs, muted: this.muted || this.deafened, ptt: this.pttDown });
   }
 
-  _applyGate() {
-    const s = this.settings;
-    let open;
-    if (this.muted || this.deafened) open = false;
-    else if (s.inputMode === 'ptt') open = this.pttDown;
-    else if (s.inputMode === 'vad') open = this.vadOpen;
-    else open = true;
-    if (this.track) this.track.enabled = open;
-    this._setTransmitting(open && !!this.track);
+  /** Level messages are only produced while someone shows a meter. */
+  meter(on) {
+    this._meterUsers = Math.max(0, this._meterUsers + (on ? 1 : -1));
+    this.node?.port.postMessage({ meter: this._meterUsers > 0 });
+  }
+
+  /** Connect the PCM tap to the media worker (custom pipeline). */
+  setPcm(port, { on, frameMs, channels }) {
+    this._pcm = { pcm: on, frameMs, channels };
+    if (port) {
+      this._pcmPort = port;
+      this.node?.port.postMessage({ pcmPort: port, ...this._pcm }, [port]);
+      return;
+    }
+    this.node?.port.postMessage(this._pcm);
   }
 
   _setTransmitting(value) {
@@ -147,33 +148,29 @@ export class AudioEngine extends Emitter {
 
   setMuted(value) {
     this.muted = value;
-    this._applyGate();
+    this.syncGate();
   }
 
   setDeafened(value) {
     this.deafened = value;
-    this._applyGate();
+    this.syncGate();
   }
 
   setPtt(down) {
-    clearTimeout(this._pttReleaseTimer);
+    clearTimeout(this._pttTimer);
     if (down) {
+      if (this.pttDown) return;
       this.pttDown = true;
-      this._applyGate();
+      this.syncGate();
     } else {
-      // A short release delay avoids cutting off the last syllable.
-      this._pttReleaseTimer = setTimeout(() => {
+      // Short release delay so the last syllable isn't cut off.
+      this._pttTimer = setTimeout(() => {
         this.pttDown = false;
-        this._applyGate();
+        this.syncGate();
       }, this.settings.pttReleaseMs);
     }
   }
 
-  refreshGate() {
-    this._applyGate();
-  }
-
-  /** Play your own microphone back to you (to judge quality and latency). */
   startLoopback() {
     if (!this.track || this._loopback) return;
     const el = new Audio();
@@ -195,23 +192,18 @@ export class AudioEngine extends Emitter {
   }
 }
 
-/** Tiny synthesized UI sounds (no asset files needed). */
+/** Tiny synthesized UI sounds. The audio device is released when idle. */
 export class Sfx {
   constructor() {
     this.ctx = null;
     this.enabled = true;
     this.sinkId = '';
-  }
-
-  _ensure() {
-    if (!this.ctx) this.ctx = new AudioContext({ latencyHint: 'interactive' });
-    if (this.sinkId && this.ctx.setSinkId) this.ctx.setSinkId(this.sinkId).catch(() => {});
-    return this.ctx;
+    this._idle = null;
   }
 
   setSink(id) {
-    this.sinkId = id;
-    if (this.ctx?.setSinkId) this.ctx.setSinkId(id || '').catch(() => {});
+    this.sinkId = id || '';
+    if (this.ctx?.setSinkId) this.ctx.setSinkId(this.sinkId).catch(() => {});
   }
 
   play(kind) {
@@ -225,12 +217,16 @@ export class Sfx {
       connect: [392, 523.25, 659.25],
     }[kind];
     if (!tones) return;
-    const ctx = this._ensure();
+    if (!this.ctx) {
+      this.ctx = new AudioContext({ latencyHint: 'interactive' });
+      if (this.sinkId && this.ctx.setSinkId) this.ctx.setSinkId(this.sinkId).catch(() => {});
+    }
+    const ctx = this.ctx;
+    if (ctx.state === 'suspended') ctx.resume();
     const start = ctx.currentTime + 0.01;
     tones.forEach((freq, i) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.type = 'sine';
       osc.frequency.value = freq;
       const t = start + i * 0.08;
       gain.gain.setValueAtTime(0, t);
@@ -240,5 +236,8 @@ export class Sfx {
       osc.start(t);
       osc.stop(t + 0.13);
     });
+    // An open AudioContext keeps the sound card busy: suspend when quiet.
+    clearTimeout(this._idle);
+    this._idle = setTimeout(() => ctx.suspend().catch(() => {}), 1500);
   }
 }

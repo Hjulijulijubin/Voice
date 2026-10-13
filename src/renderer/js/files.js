@@ -1,227 +1,372 @@
-import { Emitter, uid } from './util.js';
+import { Emitter } from './util.js';
 import { store } from './store.js';
+import { seal, open, randomHex, fromHex, toHex, signObject, verifyObject, peerIdFromPub } from './crypto.js';
 
 const CHUNK = 64 * 1024;
-const HIGH_WATER = 8 * 1024 * 1024;
-const STALL_TIMEOUT = 15000;
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+const WINDOW = 32; // chunks requested at once (2 MB) — bounds memory at relays
+const READ_BLOCK = 16; // chunks per disk read
+const WRITE_BLOCK = 16 * CHUNK; // bytes buffered before a disk write
+const STALL_MS = 15000;
+const HIGH_WATER = 4 * 1024 * 1024;
+const fs = () => window.voice.files;
 
 /**
- * Peer-to-peer file sharing over the "file" data channel.
+ * Peer-to-peer file sharing with local storage on every member's disk.
  *
- * Sharing a file posts a small chat message with the file's metadata.
- * Anyone who wants the file requests it from the uploader, or from any other
- * peer that already downloaded it (every downloader becomes a seeder).
- *
- * Binary frame: [u8 idLength][fileId utf8][payload bytes]
+ * - Files live on disk (main process), never fully in memory.
+ * - Transfers go to/through any route (direct or relayed); every chunk is
+ *   AES-GCM encrypted with the room key, and the whole file is verified
+ *   against the SHA-256 the uploader signed.
+ * - Every member publishes a signed "holder" record per file (has / deleted).
+ *   When no member holds a file any more, it disappears from the chat.
  */
 export class FileManager extends Emitter {
-  constructor(mesh) {
+  constructor(room) {
     super();
-    this.mesh = mesh;
-    /** fileId -> Blob we can serve */
-    this.local = new Map();
-    /** fileId -> Set(peerId) peers that announced they have it */
+    this.room = room;
+    /** fileId -> Map(peerId -> record) */
     this.holders = new Map();
-    /** fileId -> active download */
+    /** fileId -> size on disk */
+    this.local = new Map();
+    this.metas = new Map();
     this.downloads = new Map();
-    /** fileId -> object URL */
-    this.urls = new Map();
-    this.uploads = 0;
-
-    mesh.on('file-data', (peer, data) => this._onChunk(peer, data));
+    this.uploads = new Map();
   }
 
-  /** Register a local file and return the metadata to put in a chat message. */
+  get roomId() {
+    return this.room.id;
+  }
+
+  async init() {
+    for (const { fileId, size } of await fs().list(this.roomId)) this.local.set(fileId, size);
+    for (const rec of await store.holders(this.roomId)) this._setRec(rec);
+    // Files on disk without our own record (e.g. after a crash) are announced.
+    for (const fileId of this.local.keys()) {
+      const mine = this.holders.get(fileId)?.get(this.room.selfId);
+      if (!mine || !mine.has) await this.setHolder(fileId, true, false);
+    }
+  }
+
+  _setRec(rec) {
+    if (!this.holders.has(rec.fileId)) this.holders.set(rec.fileId, new Map());
+    this.holders.get(rec.fileId).set(rec.peer, rec);
+  }
+
+  holdersOf(fileId) {
+    return [...(this.holders.get(fileId)?.values() || [])].filter((r) => r.has).map((r) => r.peer);
+  }
+
+  /** True once every member who ever had the file has deleted it. */
+  isGone(fileId) {
+    const recs = this.holders.get(fileId);
+    return !!recs && recs.size > 0 && ![...recs.values()].some((r) => r.has);
+  }
+
+  hasLocal(fileId) {
+    return this.local.has(fileId);
+  }
+
+  deletedByMe(fileId) {
+    return this.holders.get(fileId)?.get(this.room.selfId)?.has === false;
+  }
+
+  url(meta) {
+    return `voicefile://${this.roomId}/${meta.id}?type=${encodeURIComponent(meta.type || 'application/octet-stream')}`;
+  }
+
+  // ------------------------------------------------------------ holders
+  async setHolder(fileId, has, broadcast = true) {
+    const body = { fileId, peer: this.room.selfId, has, ts: Date.now() };
+    const rec = { ...body, pub: this.room.identity.pub, sig: await signObject(this.room.identity, body) };
+    const changed = await store.mergeHolders(this.roomId, [rec]);
+    changed.forEach((r) => this._setRec(r));
+    if (broadcast) this.room.overlay.broadcast({ t: 'holders', recs: [rec] });
+    this.emit('holders', fileId);
+    return rec;
+  }
+
+  async onHolders(recs) {
+    if (!Array.isArray(recs)) return;
+    const valid = [];
+    await Promise.all(
+      recs.slice(0, 2000).map(async (r) => {
+        if (!r || typeof r.fileId !== 'string' || !/^[0-9a-f]{32}$/.test(r.fileId) || typeof r.has !== 'boolean' || typeof r.ts !== 'number') return;
+        if (typeof r.pub !== 'string' || (await peerIdFromPub(r.pub)) !== r.peer) return;
+        if (!(await verifyObject(r.pub, { fileId: r.fileId, peer: r.peer, has: r.has, ts: r.ts }, r.sig))) return;
+        valid.push({ fileId: r.fileId, peer: r.peer, has: r.has, ts: r.ts, pub: r.pub, sig: r.sig });
+      }),
+    );
+    const changed = await store.mergeHolders(this.roomId, valid);
+    for (const rec of changed) {
+      this._setRec(rec);
+      this.emit('holders', rec.fileId);
+      const meta = this.metas.get(rec.fileId);
+      if (rec.has && meta) this.maybeAutoDownload(meta);
+    }
+  }
+
+  /** All holder records, for syncing a newly connected peer. */
+  allRecords() {
+    const out = [];
+    for (const recs of this.holders.values()) for (const r of recs.values()) out.push({ fileId: r.fileId, peer: r.peer, has: r.has, ts: r.ts, pub: r.pub, sig: r.sig });
+    return out;
+  }
+
+  // ------------------------------------------------------------ sharing
+  /** Copy a local file into the room's storage; returns signed-ready metadata. */
   async share(file) {
-    const meta = { id: uid(), name: file.name || 'file', size: file.size, type: file.type || 'application/octet-stream' };
-    this.local.set(meta.id, file);
-    // Keep a copy so we can keep seeding after a restart.
-    store.putFile(meta.id, file, meta).catch(() => {});
+    const id = randomHex(16);
+    const path = fs().pathFor(file);
+    let result;
+    if (path) {
+      result = await fs().importPath(this.roomId, id, path);
+    } else {
+      // Pasted data without a path: stream it through in 1 MB pieces.
+      const token = await fs().begin(this.roomId, id);
+      try {
+        for (let off = 0; off < file.size; off += WRITE_BLOCK) {
+          await fs().write(token, off, new Uint8Array(await file.slice(off, off + WRITE_BLOCK).arrayBuffer()));
+        }
+        result = await fs().finish(token);
+      } catch (err) {
+        await fs().abort(token);
+        throw err;
+      }
+    }
+    this.local.set(id, result.size);
+    const meta = { id, name: file.name || 'pasted-file', size: result.size, type: file.type || 'application/octet-stream', sha256: result.sha256 };
+    this.metas.set(id, meta);
+    await this.setHolder(id, true);
     return meta;
   }
 
-  async getLocal(fileId) {
-    if (this.local.has(fileId)) return this.local.get(fileId);
-    const blob = await store.getFile(fileId).catch(() => null);
-    if (blob) this.local.set(fileId, blob);
-    return blob;
+  /** A chat message referenced a file. */
+  register(meta) {
+    if (!this.metas.has(meta.id)) this.metas.set(meta.id, meta);
+    this.maybeAutoDownload(meta);
   }
 
-  async urlFor(fileId) {
-    if (this.urls.has(fileId)) return this.urls.get(fileId);
-    const blob = await this.getLocal(fileId);
-    if (!blob) return null;
-    const url = URL.createObjectURL(blob);
-    this.urls.set(fileId, url);
-    return url;
+  maybeAutoDownload(meta) {
+    const limitMb = this.room.settings.autoDownloadMB;
+    if (this.local.has(meta.id) || this.downloads.has(meta.id) || this.deletedByMe(meta.id)) return;
+    if (limitMb === 0 || (limitMb > 0 && meta.size > limitMb * 1024 * 1024)) return;
+    if (!this._sources(meta.id).length) return;
+    this.download(meta).catch(() => {});
   }
 
-  isDownloading(fileId) {
-    return this.downloads.has(fileId);
+  async deleteLocal(fileId) {
+    this.downloads.get(fileId)?.cancel();
+    await fs().remove(this.roomId, fileId);
+    this.local.delete(fileId);
+    await this.setHolder(fileId, false);
   }
 
-  /** Handle control messages arriving on the chat channel. */
-  async onControl(peer, msg) {
-    switch (msg.t) {
-      case 'file-req': {
-        const blob = await this.getLocal(msg.fileId);
-        if (!blob) {
-          peer.sendJson({ t: 'file-err', fileId: msg.fileId, reason: 'not-found' });
-          return;
-        }
-        peer.sendJson({ t: 'file-ok', fileId: msg.fileId, size: blob.size });
-        this._upload(peer, msg.fileId, blob).catch((err) => {
-          console.warn('upload failed', err);
-          peer.sendJson({ t: 'file-err', fileId: msg.fileId, reason: 'aborted' });
-        });
-        break;
-      }
-      case 'file-err': {
-        const dl = this.downloads.get(msg.fileId);
-        if (dl && dl.peerId === peer.id) dl.next(new Error(msg.reason));
-        break;
-      }
-      case 'file-ok': {
-        const dl = this.downloads.get(msg.fileId);
-        if (dl && dl.peerId === peer.id) dl.touch();
-        break;
-      }
-      case 'file-have': {
-        if (!this.holders.has(msg.fileId)) this.holders.set(msg.fileId, new Set());
-        this.holders.get(msg.fileId).add(peer.id);
-        break;
-      }
-      default:
-        break;
-    }
+  /** Leaving the room: tell everyone we no longer hold anything. */
+  async releaseAll() {
+    const recs = [];
+    for (const fileId of this.local.keys()) recs.push(await this.setHolder(fileId, false, false));
+    if (recs.length) this.room.overlay.broadcast({ t: 'holders', recs });
   }
 
-  async _upload(peer, fileId, blob) {
-    const ch = peer.file;
-    const idBytes = encoder.encode(fileId);
-    this.uploads++;
-    this.emit('uploads', this.uploads);
-    try {
-      for (let offset = 0; offset < blob.size; offset += CHUNK) {
-        if (ch.readyState !== 'open') throw new Error('channel closed');
-        if (ch.bufferedAmount > HIGH_WATER) {
-          await new Promise((resolve, reject) => {
-            const onLow = () => {
-              ch.removeEventListener('bufferedamountlow', onLow);
-              ch.removeEventListener('close', onClose);
-              resolve();
-            };
-            const onClose = () => {
-              ch.removeEventListener('bufferedamountlow', onLow);
-              reject(new Error('channel closed'));
-            };
-            ch.addEventListener('bufferedamountlow', onLow);
-            ch.addEventListener('close', onClose);
-          });
-        }
-        const payload = new Uint8Array(await blob.slice(offset, offset + CHUNK).arrayBuffer());
-        const frame = new Uint8Array(1 + idBytes.length + payload.length);
-        frame[0] = idBytes.length;
-        frame.set(idBytes, 1);
-        frame.set(payload, 1 + idBytes.length);
-        ch.send(frame);
-      }
-    } finally {
-      this.uploads--;
-      this.emit('uploads', this.uploads);
-    }
+  /** Online holders, fastest route first. */
+  _sources(fileId) {
+    const holders = new Set(this.holdersOf(fileId));
+    return this.room.overlay
+      .roster()
+      .filter((m) => holders.has(m.id))
+      .sort((a, b) => (a.route?.cost ?? 1e9) - (b.route?.cost ?? 1e9))
+      .map((m) => m.id);
   }
 
-  _onChunk(peer, data) {
-    if (!(data instanceof ArrayBuffer)) return;
-    const bytes = new Uint8Array(data);
-    const idLen = bytes[0];
-    const fileId = decoder.decode(bytes.subarray(1, 1 + idLen));
-    const dl = this.downloads.get(fileId);
-    if (!dl || dl.peerId !== peer.id) return;
-    const payload = bytes.subarray(1 + idLen);
-    dl.chunks.push(payload);
-    dl.received += payload.length;
-    dl.touch();
-    this.emit('progress', fileId, dl.received / dl.meta.size);
-    if (dl.received >= dl.meta.size) dl.finish();
-  }
-
-  /**
-   * Download a file from whoever has it. Resolves with a Blob.
-   * @param {{id,name,size,type}} meta
-   * @param {string} ownerUserId
-   */
-  download(meta, ownerUserId) {
-    if (this.local.has(meta.id)) return Promise.resolve(this.local.get(meta.id));
+  // ------------------------------------------------------------ download
+  download(meta) {
+    if (this.local.has(meta.id)) return Promise.resolve();
     if (this.downloads.has(meta.id)) return this.downloads.get(meta.id).promise;
-
-    const candidates = () => {
-      const open = this.mesh.openPeers();
-      const owner = open.filter((p) => p.info.userId === ownerUserId);
-      const holders = open.filter((p) => this.holders.get(meta.id)?.has(p.id));
-      return [...new Set([...owner, ...holders, ...open])];
-    };
-
+    const total = Math.ceil(meta.size / CHUNK);
+    const tried = new Set();
     let resolveFn;
     let rejectFn;
-    const promise = new Promise((resolve, reject) => {
-      resolveFn = resolve;
-      rejectFn = reject;
-    });
-    const tried = new Set();
     const dl = {
       meta,
-      promise,
-      chunks: [],
-      received: 0,
-      peerId: null,
+      total,
+      next: 0, // next chunk index expected
+      requested: 0, // chunks requested so far from the current source
+      source: null,
+      token: null,
+      pending: [], // decrypted chunks not yet written
+      pendingBytes: 0,
+      writing: Promise.resolve(),
       timer: null,
-      touch: () => {
-        clearTimeout(dl.timer);
-        dl.timer = setTimeout(() => dl.next(new Error('stalled')), STALL_TIMEOUT);
-      },
-      next: () => {
-        clearTimeout(dl.timer);
-        const peer = candidates().find((p) => !tried.has(p.id));
-        if (!peer) {
-          this.downloads.delete(meta.id);
-          this.emit('progress', meta.id, null);
-          rejectFn(new Error('Nobody online has this file right now'));
-          return;
+      promise: new Promise((res, rej) => {
+        resolveFn = res;
+        rejectFn = rej;
+      }),
+      cancel: () => fail(new Error('cancelled')),
+    };
+    const fail = async (err) => {
+      clearTimeout(dl.timer);
+      this.downloads.delete(meta.id);
+      if (dl.token) await fs().abort(dl.token).catch(() => {});
+      this.emit('progress', meta.id, null);
+      rejectFn(err);
+    };
+    dl.touch = () => {
+      clearTimeout(dl.timer);
+      dl.timer = setTimeout(() => dl.nextSource(), STALL_MS);
+    };
+    dl.request = () => {
+      const count = Math.min(WINDOW, total - dl.requested);
+      if (count <= 0) return;
+      this.room.overlay.sendTo(dl.source, { t: 'f-req', fileId: meta.id, index: dl.requested, count });
+      dl.requested += count;
+    };
+    dl.nextSource = () => {
+      const src = this._sources(meta.id).find((id) => !tried.has(id));
+      if (!src) return fail(new Error('Nobody online has this file right now'));
+      tried.add(src);
+      dl.source = src;
+      dl.requested = dl.next; // resume where we are
+      dl.touch();
+      dl.request();
+      dl.request(); // keep two windows in flight
+    };
+    dl.onChunk = async (index, data) => {
+      if (index !== dl.next) return; // stale data from a previous source
+      dl.next++;
+      dl.touch();
+      dl.pending.push(data);
+      dl.pendingBytes += data.length;
+      this.emit('progress', meta.id, dl.next / total);
+      if (dl.requested - dl.next < WINDOW) dl.request();
+      const last = dl.next === total;
+      if (dl.pendingBytes >= WRITE_BLOCK || last) {
+        const chunks = dl.pending;
+        const offset = (dl.next - chunks.length) * CHUNK;
+        dl.pending = [];
+        dl.pendingBytes = 0;
+        const buf = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+        let o = 0;
+        for (const c of chunks) {
+          buf.set(c, o);
+          o += c.length;
         }
-        tried.add(peer.id);
-        dl.peerId = peer.id;
-        dl.chunks = [];
-        dl.received = 0;
-        dl.touch();
-        peer.sendJson({ t: 'file-req', fileId: meta.id });
-      },
-      finish: async () => {
+        dl.writing = dl.writing.then(() => fs().write(dl.token, offset, buf));
+      }
+      if (last) {
         clearTimeout(dl.timer);
-        this.downloads.delete(meta.id);
-        const blob = new Blob(dl.chunks, { type: meta.type });
-        this.local.set(meta.id, blob);
-        store.putFile(meta.id, blob, meta).catch(() => {});
-        this.mesh.broadcast({ t: 'file-have', fileId: meta.id });
-        this.emit('progress', meta.id, 1);
-        resolveFn(blob);
-      },
+        try {
+          await dl.writing;
+          await fs().finish(dl.token, meta.sha256);
+          this.downloads.delete(meta.id);
+          this.local.set(meta.id, meta.size);
+          await this.setHolder(meta.id, true);
+          this.emit('progress', meta.id, 1);
+          resolveFn();
+        } catch (err) {
+          dl.token = null;
+          fail(err);
+        }
+      }
     };
     this.downloads.set(meta.id, dl);
-    if (meta.size === 0) {
-      dl.finish();
-    } else {
-      dl.next();
-    }
-    return promise;
+    (async () => {
+      dl.token = await fs().begin(this.roomId, meta.id);
+      if (total === 0) {
+        dl.next = 0;
+        await fs().finish(dl.token, meta.sha256);
+        this.downloads.delete(meta.id);
+        this.local.set(meta.id, 0);
+        await this.setHolder(meta.id, true);
+        this.emit('progress', meta.id, 1);
+        return resolveFn();
+      }
+      dl.nextSource();
+    })().catch(fail);
+    return dl.promise;
   }
 
-  /** Forget a peer that left: re-route its downloads to someone else. */
-  peerGone(peerId) {
-    for (const set of this.holders.values()) set.delete(peerId);
-    for (const dl of this.downloads.values()) if (dl.peerId === peerId) dl.next(new Error('peer left'));
+  /** Incoming chunk frame: [16 fileId][u32 index][sealed chunk] */
+  async onFrame(payload) {
+    if (payload.length < 20 + 28) return;
+    const fileId = toHex(payload.subarray(0, 16));
+    const dl = this.downloads.get(fileId);
+    if (!dl) return;
+    const index = new DataView(payload.buffer, payload.byteOffset + 16, 4).getUint32(0);
+    let data;
+    try {
+      data = await open(this.room.keys.dataKey, payload.subarray(20), `${fileId}:${index}`);
+    } catch {
+      return;
+    }
+    dl.queue = (dl.queue || Promise.resolve()).then(() => dl.onChunk(index, data));
+  }
+
+  // ------------------------------------------------------------ upload
+  async onRequest(from, msg) {
+    const { fileId, index, count } = msg;
+    if (typeof fileId !== 'string' || !/^[0-9a-f]{32}$/.test(fileId) || !Number.isInteger(index) || !Number.isInteger(count) || count < 1 || count > WINDOW) return;
+    if (!this.local.has(fileId)) {
+      this.room.overlay.sendTo(from, { t: 'f-err', fileId });
+      return;
+    }
+    const key = `${from}:${fileId}`;
+    // Windows for the same transfer are served in order.
+    const prev = this.uploads.get(key) || Promise.resolve();
+    const job = prev.then(() => this._send(from, fileId, index, count)).catch(() => {});
+    this.uploads.set(key, job);
+    this.emit('uploads', this.uploads.size);
+    await job;
+    if (this.uploads.get(key) === job) {
+      this.uploads.delete(key);
+      this.emit('uploads', this.uploads.size);
+    }
+  }
+
+  async _send(to, fileId, index, count) {
+    const size = this.local.get(fileId);
+    const total = Math.ceil(size / CHUNK);
+    const end = Math.min(total, index + count);
+    const idBytes = fromHex(fileId);
+    for (let block = index; block < end; block += READ_BLOCK) {
+      const n = Math.min(READ_BLOCK, end - block);
+      const bytes = await fs().read(this.roomId, fileId, block * CHUNK, n * CHUNK);
+      for (let k = 0; k < n; k++) {
+        const i = block + k;
+        const chunk = bytes.subarray(k * CHUNK, (k + 1) * CHUNK);
+        const sealed = await seal(this.room.keys.dataKey, chunk, `${fileId}:${i}`);
+        const payload = new Uint8Array(20 + sealed.length);
+        payload.set(idBytes);
+        new DataView(payload.buffer).setUint32(16, i);
+        payload.set(sealed, 20);
+        const channel = this.room.overlay.sendFileFrame(to, payload);
+        if (!channel) throw new Error('no route');
+        if (channel.bufferedAmount > HIGH_WATER) {
+          await new Promise((resolve) => {
+            const done = () => {
+              channel.removeEventListener('bufferedamountlow', done);
+              channel.removeEventListener('close', done);
+              resolve();
+            };
+            channel.addEventListener('bufferedamountlow', done);
+            channel.addEventListener('close', done);
+          });
+        }
+      }
+    }
+  }
+
+  onError(from, msg) {
+    const dl = this.downloads.get(msg.fileId);
+    if (dl && dl.source === from) dl.nextSource();
+  }
+
+  peerGone(id) {
+    for (const dl of this.downloads.values()) if (dl.source === id) dl.nextSource();
+  }
+
+  totalBytes() {
+    let n = 0;
+    for (const s of this.local.values()) n += s;
+    return n;
   }
 }

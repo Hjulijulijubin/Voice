@@ -1,6 +1,8 @@
-import { h, prefs, formatBytes } from './util.js';
+import { h, prefs } from './util.js';
 import { modal, toast } from './ui.js';
 import { DEFAULT_QUALITY, OPUS_MAX_BITRATE } from './opus.js';
+
+export const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net', 'wss://nostr.mom', 'wss://relay.snort.social'];
 
 export const DEFAULT_SETTINGS = {
   inputDeviceId: '',
@@ -15,7 +17,13 @@ export const DEFAULT_SETTINGS = {
   pttReleaseMs: 120,
   quality: { ...DEFAULT_QUALITY },
   jitterTargetMs: 0,
+  audioMode: 'auto', // 'auto' (WebRTC direct, custom when relayed) | 'ultra' (custom pipeline everywhere)
+  ultraFrameMs: 5,
+  allowRelay: true,
+  relays: [...DEFAULT_RELAYS],
+  lan: true,
   iceServers: '',
+  autoDownloadMB: 50, // 0 = never, -1 = always
   sounds: true,
   notifications: true,
 };
@@ -95,7 +103,7 @@ const PRESETS = {
 export function openSettings(app, initialTab = 'audio') {
   const s = app.settings;
   const cleanups = [];
-  const tabNames = { audio: 'Voice & Audio', quality: 'Opus Quality', network: 'Network', profile: 'Profile', about: 'About' };
+  const tabNames = { audio: 'Voice & Audio', quality: 'Opus Quality', network: 'Network & Files', profile: 'Profile', about: 'About' };
   const tabsEl = h('div', { class: 'tabs' });
   const body = h('div');
   let current = initialTab;
@@ -113,7 +121,7 @@ export function openSettings(app, initialTab = 'audio') {
     body.replaceChildren();
     if (name === 'audio') await audioTab();
     if (name === 'quality') qualityTab();
-    if (name === 'network') networkTab();
+    if (name === 'network') await networkTab();
     if (name === 'profile') profileTab();
     if (name === 'about') await aboutTab();
   };
@@ -166,15 +174,16 @@ export function openSettings(app, initialTab = 'audio') {
       marker.style.display = s.inputMode === 'vad' ? '' : 'none';
     };
     updateMarker();
-    let raf = 0;
-    const tick = () => {
-      const lvl = app.audio.running ? app.audio.level : -100;
+    // Level messages only flow while a meter is visible (saves CPU otherwise).
+    app.audio.meter(true);
+    const offLevel = app.audio.on('level', (lvl) => {
       fill.style.width = `${dbToPct(lvl)}%`;
       fill.classList.toggle('below', s.inputMode === 'vad' && lvl < s.vadThreshold);
-      raf = requestAnimationFrame(tick);
-    };
-    tick();
-    cleanups.push(() => cancelAnimationFrame(raf));
+    });
+    cleanups.push(() => {
+      offLevel();
+      app.audio.meter(false);
+    });
 
     const vadValue = h('span', {}, `${s.vadThreshold} dB`);
     const vadSlider = h('input', {
@@ -188,6 +197,7 @@ export function openSettings(app, initialTab = 'audio') {
         vadValue.textContent = `${s.vadThreshold} dB`;
         updateMarker();
         save();
+        app.audio.syncGate();
       },
     });
 
@@ -231,7 +241,7 @@ export function openSettings(app, initialTab = 'audio') {
           onchange: () => {
             s.inputMode = value;
             save();
-            app.audio.refreshGate();
+            app.audio.syncGate();
             app.renderSelf();
             updateMarker();
             pttBox.classList.toggle('hidden', value !== 'ptt');
@@ -490,22 +500,114 @@ export function openSettings(app, initialTab = 'audio') {
   }
 
   // ----------------------------------------------------------- network tab
-  function networkTab() {
-    const ta = h('textarea', { rows: 5, class: 'mono', placeholder: 'turn:turn.example.com:3478|username|password\nstun:stun.example.com:3478', style: { width: '100%' } });
-    ta.value = s.iceServers;
-    ta.onchange = () => {
-      s.iceServers = ta.value;
+  async function networkTab() {
+    const radio = (name, value, label, hint, current, onPick) =>
+      h(
+        'label',
+        { class: 'check' },
+        h('input', { type: 'radio', name, value, checked: current === value, onchange: () => onPick(value) }),
+        h('div', {}, h('div', {}, label), h('div', { class: 'hint' }, hint)),
+      );
+    const check = (key, label, hint, after) =>
+      h(
+        'label',
+        { class: 'check' },
+        h('input', {
+          type: 'checkbox',
+          checked: s[key],
+          onchange: (e) => {
+            s[key] = e.target.checked;
+            save();
+            after?.();
+          },
+        }),
+        h('div', {}, h('div', {}, label), hint ? h('div', { class: 'hint' }, hint) : null),
+      );
+
+    const relays = h('textarea', { rows: 4, class: 'mono', style: { width: '100%' } });
+    relays.value = s.relays.join('\n');
+    relays.onchange = () => {
+      s.relays = relays.value.split('\n').map((l) => l.trim()).filter((l) => /^wss?:\/\//i.test(l));
       save();
-      toast('Saved. Takes effect the next time you connect to a server.');
+      app.applyNetwork();
+      toast('Rendezvous relays updated');
     };
+    const ice = h('textarea', { rows: 3, class: 'mono', placeholder: 'turn:turn.example.com:3478|username|password', style: { width: '100%' } });
+    ice.value = s.iceServers;
+    ice.onchange = () => {
+      s.iceServers = ice.value;
+      save();
+      toast('Saved. Applies to new connections.');
+    };
+    const status = await window.voice.rendezvous.status();
+    const openRelays = status.relays.filter((r) => r.open).length;
+
+    const auto = h(
+      'select',
+      {
+        onchange: (e) => {
+          s.autoDownloadMB = Number(e.target.value);
+          save();
+        },
+      },
+      ...[
+        [0, 'Never (download on click)'],
+        [10, 'Files up to 10 MB'],
+        [50, 'Files up to 50 MB'],
+        [250, 'Files up to 250 MB'],
+        [1024, 'Files up to 1 GB'],
+        [-1, 'Everything'],
+      ].map(([v, l]) => h('option', { value: v, selected: s.autoDownloadMB === v }, l)),
+    );
+
     body.append(
       h(
         'div',
-        { class: 'callout' },
-        'Audio, chat and files travel directly between peers (encrypted with DTLS/SRTP). Public STUN servers are used to discover your public address. ',
-        'If two people are behind strict NATs, a direct connection may be impossible — add a TURN relay here (e.g. a self-hosted coturn).',
+        { class: 'setting' },
+        h('div', { class: 'label' }, 'Audio transport'),
+        radio('audioMode', 'auto', 'Automatic (recommended)', 'Direct WebRTC audio with adaptive jitter buffer; switches to routing through other members when that is faster or a direct connection is impossible.', s.audioMode, (v) => {
+          s.audioMode = v;
+          save();
+          app.applyMode();
+        }),
+        radio('audioMode', 'ultra', 'Ultra-low latency', 'Custom pipeline for everyone: 2.5–10 ms Opus frames, minimal buffering, always on the fastest route. Best on good networks.', s.audioMode, (v) => {
+          s.audioMode = v;
+          save();
+          app.applyMode();
+        }),
+        h(
+          'div',
+          { class: 'row', style: { alignItems: 'center', marginTop: '6px' } },
+          h('span', { class: 'muted small' }, 'Ultra frame size'),
+          h(
+            'select',
+            {
+              onchange: (e) => {
+                s.ultraFrameMs = Number(e.target.value);
+                save();
+                app.applyMode();
+              },
+            },
+            ...[2.5, 5, 10].map((v) => h('option', { value: v, selected: s.ultraFrameMs === v }, `${v} ms`)),
+          ),
+        ),
       ),
-      h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Extra STUN / TURN servers'), ta, h('div', { class: 'hint' }, 'One per line. TURN format: url|username|password')),
+      h(
+        'div',
+        { class: 'setting' },
+        h('div', { class: 'label' }, 'Smart routing'),
+        check('allowRelay', 'Let my connection relay audio/data for other members', 'Helps friends who can\'t reach each other directly or have a slow path. Everything relayed stays end-to-end encrypted.', () => app.applyNetwork()),
+      ),
+      h(
+        'div',
+        { class: 'setting' },
+        h('div', { class: 'label' }, 'Finding each other', h('span', {}, `${openRelays}/${status.relays.length} relays · LAN ${status.lan ? 'on' : 'off'}`)),
+        check('lan', 'Discover members on the local network', 'Works without internet.', () => app.applyNetwork()),
+        h('div', { class: 'hint', style: { margin: '8px 0 4px' } }, 'Rendezvous relays (Nostr, one per line). They only ever see an anonymous room hash and encrypted handshakes; you can self-host one (see README).'),
+        relays,
+      ),
+      h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Extra STUN / TURN servers'), ice, h('div', { class: 'hint' }, 'Optional, one per line. TURN format: url|username|password')),
+      h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Automatically store shared files on this PC'), auto),
     );
   }
 
@@ -550,6 +652,21 @@ export function openSettings(app, initialTab = 'audio') {
         ),
       ),
       h('div', { class: 'setting' }, h('div', { class: 'label' }, 'Notifications'), check('sounds', 'Play sounds (join/leave/mute/message)'), check('notifications', 'Desktop notifications for mentions')),
+      h(
+        'div',
+        { class: 'setting' },
+        h('div', { class: 'label' }, 'Performance'),
+        h(
+          'label',
+          { class: 'check' },
+          h('input', {
+            type: 'checkbox',
+            checked: !app.hardwareAcceleration,
+            onchange: (e) => window.voice.setHardwareAcceleration(!e.target.checked),
+          }),
+          h('div', {}, h('div', {}, 'Low-resource mode (disable GPU acceleration)'), h('div', { class: 'hint' }, 'Saves memory on older PCs. Restarts the app.')),
+        ),
+      ),
     );
   }
 
@@ -566,8 +683,10 @@ export function openSettings(app, initialTab = 'audio') {
         h('dd', {}, 'Opus, 48 kHz'),
         h('dt', {}, 'Transport'),
         h('dd', {}, 'WebRTC (DTLS-SRTP, SCTP)'),
-        h('dt', {}, 'Local files limit'),
-        h('dd', {}, `${formatBytes(200 * 1024 * 1024)} kept for re-sharing`),
+        h('dt', {}, 'Relayed data'),
+        h('dd', {}, 'AES-256-GCM, room key'),
+        h('dt', {}, 'Identity'),
+        h('dd', {}, 'Ed25519, per room, no account'),
       ),
     );
   }

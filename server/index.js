@@ -2,82 +2,38 @@
 'use strict';
 
 /**
- * Standalone Voice signaling server.
+ * Optional private rendezvous relay for Voice.
  *
- *   node server/index.js --port 9987 --name "My Server" --password secret
+ *   node server/index.js --port 7777
  *
- * Options can also be given as environment variables:
- *   VOICE_PORT, VOICE_HOST, VOICE_NAME, VOICE_PASSWORD, VOICE_MAX_PEERS,
- *   VOICE_STATE_FILE, VOICE_TURN_URL, VOICE_TURN_USER, VOICE_TURN_PASS
+ * Then add ws://<host>:7777 (or wss:// behind a TLS proxy) under
+ * Settings → Network → Rendezvous relays in the app.
  */
 
-const path = require('node:path');
-const { SignalingServer } = require('../src/server/signaling');
+const { Relay } = require('../src/server/relay');
 
-function parseArgs(argv) {
-  const out = {};
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (!arg.startsWith('--')) continue;
-    const [key, inline] = arg.slice(2).split('=', 2);
-    if (inline !== undefined) out[key] = inline;
-    else if (argv[i + 1] && !argv[i + 1].startsWith('--')) out[key] = argv[++i];
-    else out[key] = true;
-  }
-  return out;
-}
+const args = process.argv.slice(2);
+const opt = (name, fallback) => {
+  const i = args.indexOf(`--${name}`);
+  return i !== -1 && args[i + 1] ? args[i + 1] : fallback;
+};
 
-const args = parseArgs(process.argv.slice(2));
-
-if (args.help || args.h) {
-  console.log(`Voice signaling server
-
-Usage: node server/index.js [options]
-
-  --port <n>          Port to listen on (default 9987)
-  --host <addr>       Interface to bind (default 0.0.0.0)
-  --name <name>       Server name shown to clients
-  --password <pw>     Require a password to join
-  --max-peers <n>     Maximum simultaneous users (default 64)
-  --state-file <f>    Where to persist the channel list (default ./voice-server.json)
-  --turn-url <url>    TURN server pushed to clients, e.g. turn:turn.example.com:3478
-  --turn-user <u>     TURN username
-  --turn-pass <p>     TURN credential
-`);
+if (args.includes('--help')) {
+  console.log('Usage: node server/index.js [--port 7777] [--host 0.0.0.0] [--name "My relay"]\nEnv: VOICE_RELAY_PORT, VOICE_RELAY_HOST');
   process.exit(0);
 }
 
-const env = process.env;
-const iceServers = [];
-const turnUrl = args['turn-url'] || env.VOICE_TURN_URL;
-if (turnUrl) {
-  iceServers.push({
-    urls: turnUrl,
-    username: args['turn-user'] || env.VOICE_TURN_USER,
-    credential: args['turn-pass'] || env.VOICE_TURN_PASS,
-  });
-}
-
-const server = new SignalingServer({
-  port: Number(args.port || env.VOICE_PORT || 9987),
-  host: args.host || env.VOICE_HOST || '0.0.0.0',
-  name: args.name || env.VOICE_NAME || 'Voice Server',
-  password: args.password || env.VOICE_PASSWORD || '',
-  maxPeers: Number(args['max-peers'] || env.VOICE_MAX_PEERS || 64),
-  stateFile: path.resolve(args['state-file'] || env.VOICE_STATE_FILE || 'voice-server.json'),
-  iceServers,
+const relay = new Relay({
+  port: Number(opt('port', process.env.VOICE_RELAY_PORT || 7777)),
+  host: opt('host', process.env.VOICE_RELAY_HOST || '0.0.0.0'),
+  name: opt('name', 'Voice relay'),
 });
-
-server.on('log', (line) => console.log(`[${new Date().toISOString()}] ${line}`));
-
-server.start().then(
-  ({ port }) => console.log(`Voice server "${server.name}" ready. Clients connect to ws://<this-host>:${port}`),
+relay.on('log', (l) => console.log(`[${new Date().toISOString()}] ${l}`));
+relay.start().then(
+  ({ port }) => console.log(`Voice relay listening on ws://0.0.0.0:${port}`),
   (err) => {
-    console.error(`Failed to start: ${err.message}`);
+    console.error(err.message);
     process.exit(1);
   },
 );
-
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => server.stop().then(() => process.exit(0)));
-}
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => relay.stop().then(() => process.exit(0)));

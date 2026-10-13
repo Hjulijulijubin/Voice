@@ -207,7 +207,7 @@ input[type='radio'] {
 }
 
 /* ----------------------------------------------------------------- connect */
-#connect-view {
+#welcome-view {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -286,11 +286,103 @@ input[type='radio'] {
 /* -------------------------------------------------------------------- main */
 #main-view {
   display: grid;
-  grid-template-columns: 260px 1fr 240px;
+  grid-template-columns: 72px 240px 1fr 240px;
 }
 
 #main-view.no-members {
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: 72px 240px 1fr;
+}
+
+/* room rail */
+.rail {
+  background: var(--bg-0);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+  overflow-y: auto;
+}
+
+.rail-item {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 16px;
+  color: #111;
+  cursor: pointer;
+  transition: border-radius 0.15s;
+  flex-shrink: 0;
+}
+
+.rail-item:hover,
+.rail-item.active {
+  border-radius: 16px;
+}
+
+.rail-item.active::before {
+  content: '';
+  position: absolute;
+  left: -12px;
+  width: 4px;
+  height: 36px;
+  border-radius: 0 4px 4px 0;
+  background: var(--text-strong);
+}
+
+.rail-item.unread::after {
+  content: '';
+  position: absolute;
+  left: -12px;
+  width: 4px;
+  height: 8px;
+  border-radius: 0 4px 4px 0;
+  background: var(--text-strong);
+}
+
+.rail-item .voice-badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--green);
+  border: 3px solid var(--bg-0);
+}
+
+.rail-add {
+  background: var(--bg-3);
+  color: var(--green);
+}
+
+.rail-sep {
+  width: 32px;
+  height: 2px;
+  background: var(--bg-3);
+  border-radius: 1px;
+}
+
+.net-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--yellow);
+  flex-shrink: 0;
+}
+
+.net-dot.ok {
+  background: var(--green);
+}
+
+.net-dot.bad {
+  background: var(--red);
 }
 
 #main-view.no-members .members {
@@ -1178,8 +1270,9 @@ input[type='radio'] {
 }
 
 @media (max-width: 1050px) {
-  #main-view {
-    grid-template-columns: 240px 1fr;
+  #main-view,
+  #main-view.no-members {
+    grid-template-columns: 72px 220px 1fr;
   }
   .members {
     display: none;
@@ -1187,4 +1280,51 @@ input[type='radio'] {
   .connect-cards {
     grid-template-columns: 1fr;
   }
+}
+
+.file-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.file-holders {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.invite-code {
+  font-family: var(--mono);
+  font-size: 13px;
+  word-break: break-all;
+  user-select: all;
+}
+
+.brand {
+  position: relative;
+}
+
+#welcome-close {
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+.route-tag {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.storage-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--bg-2);
+  font-size: 13px;
+}
+
+.storage-row .grow {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

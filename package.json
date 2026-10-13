@@ -1,8 +1,8 @@
 {
   "name": "voice",
   "productName": "Voice",
-  "version": "0.1.0",
-  "description": "Open source peer-to-peer Discord/TeamSpeak alternative with low-latency, high-bitrate Opus voice",
+  "version": "0.2.0",
+  "description": "Peer-to-peer, end-to-end encrypted voice and chat without accounts or servers. Low-latency, high-bitrate Opus.",
   "main": "src/main/main.js",
   "license": "GPL-3.0-only",
   "author": "Voice contributors",
@@ -15,9 +15,10 @@
     "dist:win": "electron-builder --win",
     "dist:mac": "electron-builder --mac",
     "dist:linux": "electron-builder --linux",
-    "test:e2e": "node test/e2e/two-clients.mjs"
+    "test:e2e": "node test/e2e/p2p.mjs"
   },
   "dependencies": {
+    "@noble/curves": "^2.4.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
@@ -94,7 +95,8 @@
       "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Voice uses your microphone for voice chat."
-      }
+      },
+      "identity": "-"
     },
     "linux": {
       "target": [
@@ -119,9 +121,20 @@
       ],
       "category": "Network",
       "synopsis": "Peer-to-peer voice and chat",
-      "maintainer": "Voice contributors <noreply@github.com>"
+      "maintainer": "Voice contributors <noreply@github.com>",
+      "mimeTypes": [
+        "x-scheme-handler/voice"
+      ]
     },
-    "publish": null
+    "publish": null,
+    "protocols": [
+      {
+        "name": "Voice invite",
+        "schemes": [
+          "voice"
+        ]
+      }
+    ]
   },
   "engines": {
     "node": ">=20"

@@ -4,81 +4,69 @@
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob: mediastream:; connect-src 'self' ws: wss: blob:; object-src 'none'; base-uri 'none'"
+      content="default-src 'self'; script-src 'self'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' voicefile: data:; media-src 'self' voicefile: mediastream: blob:; connect-src 'self' voicefile:; object-src 'none'; base-uri 'none'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Voice</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <!-- ============================== CONNECT ============================== -->
-    <section id="connect-view" class="view">
+    <!-- ============================== WELCOME ============================== -->
+    <section id="welcome-view" class="view hidden">
       <div class="connect-wrap">
         <header class="brand">
           <div class="brand-logo" aria-hidden="true">
             <svg viewBox="0 0 64 64" width="56" height="56">
               <rect width="64" height="64" rx="16" fill="#5865f2" />
-              <path d="M14 32h4M22 22v20M30 14v36M38 20v24M46 26v12M50 32h0" stroke="#fff" stroke-width="5" stroke-linecap="round" />
+              <path d="M14 32h0M22 24v16M30 16v32M38 20v24M46 26v12M50 32h0" stroke="#fff" stroke-width="5" stroke-linecap="round" />
             </svg>
           </div>
           <div>
             <h1>Voice</h1>
-            <p class="muted">Peer-to-peer voice, chat &amp; file sharing — Opus up to 510 kbps, 10 ms frames.</p>
+            <p class="muted">No accounts. No servers. End-to-end encrypted voice, chat &amp; files — straight between friends.</p>
           </div>
+          <button class="icon-btn hidden" id="welcome-close" title="Back"></button>
         </header>
 
         <label class="field">
-          <span>Display name</span>
-          <input id="cv-name" maxlength="32" autocomplete="off" placeholder="What should people call you?" />
+          <span>Your display name</span>
+          <input id="wv-name" maxlength="32" autocomplete="off" placeholder="What should people call you?" />
         </label>
 
         <div class="connect-cards">
-          <form id="join-form" class="card">
-            <h2>Join a server</h2>
+          <form id="create-form" class="card">
+            <h2>Create a room</h2>
+            <p class="muted small">You get an invite code. Send it to your friends through any other chat — whoever has the code is in.</p>
             <label class="field">
-              <span>Address</span>
-              <input id="cv-address" placeholder="192.168.1.20:9987  or  voice.example.com" autocomplete="off" required />
+              <span>Room name</span>
+              <input id="cv-room" maxlength="40" placeholder="Friday Squad" autocomplete="off" />
             </label>
-            <label class="field">
-              <span>Password <em class="muted">(optional)</em></span>
-              <input id="cv-password" type="password" autocomplete="off" />
-            </label>
-            <button class="btn primary" type="submit">Join</button>
-            <div id="recent-servers" class="recent"></div>
+            <button class="btn primary" type="submit">Create room</button>
           </form>
 
-          <form id="host-form" class="card">
-            <h2>Host a server</h2>
-            <p class="muted small">Runs a tiny signaling server inside this app. Voice, chat and files still go directly between people.</p>
+          <form id="join-form" class="card">
+            <h2>Join with an invite code</h2>
+            <p class="muted small">Paste the code someone sent you (it starts with <code>voice:</code>).</p>
             <label class="field">
-              <span>Server name</span>
-              <input id="hv-name" maxlength="32" placeholder="My Server" autocomplete="off" />
+              <span>Invite code</span>
+              <input id="jv-code" placeholder="voice:…" autocomplete="off" spellcheck="false" />
             </label>
-            <div class="row">
-              <label class="field grow">
-                <span>Port (TCP)</span>
-                <input id="hv-port" type="number" min="1" max="65535" value="9987" />
-              </label>
-              <label class="field grow">
-                <span>Password <em class="muted">(optional)</em></span>
-                <input id="hv-password" type="password" autocomplete="off" />
-              </label>
-            </div>
-            <button class="btn" type="submit">Start server &amp; join</button>
+            <button class="btn" type="submit">Join room</button>
           </form>
         </div>
-        <p id="connect-error" class="error" role="alert"></p>
+        <p id="welcome-error" class="error" role="alert"></p>
       </div>
     </section>
 
     <!-- ============================== MAIN ============================== -->
     <section id="main-view" class="view hidden">
+      <nav class="rail" id="rail"></nav>
+
       <aside class="sidebar">
-        <button class="server-header" id="server-header" title="Server info">
-          <span class="server-name" id="server-name">Server</span>
-          <span class="badge hidden" id="host-badge">HOST</span>
+        <button class="server-header" id="room-header" title="Room settings &amp; invite">
+          <span class="server-name" id="room-name">Room</span>
+          <span class="net-dot" id="net-dot" title=""></span>
         </button>
-        <div id="reconnect-banner" class="banner hidden">Connection to server lost — reconnecting…</div>
         <nav class="channels" id="channel-list"></nav>
 
         <div class="voice-panel hidden" id="voice-panel">
@@ -108,6 +96,7 @@
           <span class="chat-sub muted" id="chat-sub"></span>
           <span class="spacer"></span>
           <span class="transfer-indicator hidden" id="upload-indicator"></span>
+          <button class="icon-btn" id="btn-invite" title="Invite people"></button>
           <button class="icon-btn" id="btn-toggle-members" title="Member list"></button>
         </header>
         <div class="messages" id="messages"></div>
@@ -117,7 +106,7 @@
           <textarea id="composer-input" rows="1" maxlength="4000" placeholder="Message"></textarea>
           <input type="file" id="file-input" multiple hidden />
         </form>
-        <div class="drop-overlay hidden" id="drop-overlay"><div>Drop files to share them peer-to-peer</div></div>
+        <div class="drop-overlay hidden" id="drop-overlay"><div>Drop files to share them with the room</div></div>
       </main>
 
       <aside class="members" id="members"></aside>
